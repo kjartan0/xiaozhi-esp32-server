@@ -22,8 +22,21 @@
   排在卡死的请求后面（实测：18 token 的小请求把 loop 卡死后，2k 预热排队 30s，
   随后 watchdog 杀掉引擎）。因此记一个指数退避截止时间，期间任何预热直接跳过；
   真实轮次成功后再清除退避。预热自身失败也计入故障；
+- **探针尾部必须有 >=64 个未缓存 prefill 行（t_ae32b506 / t_d5763018）**：Splash native engine
+  在 transport 线程上同步编译 Metal compute pipeline，未缓存行数落在 18–29 行的小区间时
+  MTLCompilerService 的 XPC 回复永远不回来，循环答不上 STATUS_REQUEST，30s 后 watchdog
+  杀掉引擎（实测 18/23/29 行 3/3 致命；35/36/55/64/120 行 0.2–0.7s 正常）。预热的尾部
+  （probe 句子 + 生成提示）实测只有 16 行，离致命下沿 18 只差 2 行，而且同一分钟内两个会话
+  的 `{{current_time}}` 相同 → 前缀命中缓存后未缓存行数就只剩尾部。所以探针 = 一次性 nonce
+  + 一句自然语言 + 填充散文，凑够 >=64 token 的尾部（填充在末尾，不影响真实首轮的前缀命中）；
 - 超时（timeout_seconds）后放弃；
 - 任何失败只记日志，绝不影响会话。
+
+**当前状态（t_ae32b506，2026-11-15）：在 Splash 1.6.0-m1 上 `enable: false`。**
+引擎的整段前缀缓存只对逐字节相同的提示词命中，预热之后真实首轮只能复用 2,016/2,048 行，
+剩下的 32 行小 prefill 实测要 1.8 s（18–29 行直接触发 watchdog），所以预热拿不到
+turn-1 的收益、还占用单槽约 2.1 s。理由与实测见 `data/.config.yaml` 的 `llm_warmup`
+注释；换到前缀缓存行为正常的引擎后可以安全地重新打开（探针守卫仍然有效）。
 
 配置（data/.config.yaml）：
     llm_warmup:
@@ -38,6 +51,7 @@
 import hashlib
 import json
 import os
+import random
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -57,6 +71,23 @@ WARMUP_MAX_TOKENS = 8
 # 已复现 5/5；一句自然的荷兰语陈述句同形状可正常返回（TTFT 2.2s，冷/热各 3/3）。
 # 因此默认探针用一句话，而不是单词。
 WARMUP_PROBE_TEXT = "de kat slaapt lekker op de warme bank, wat vind je daarvan"
+
+# 探针尾部的**最小未缓存 prefill 行数**（t_ae32b506，机理见 t_d5763018）。
+# Splash native engine 在 transport 线程上同步创建 Metal compute pipeline：未缓存行数落在
+# 18–29 行的小区间时 MTLCompilerService 的 XPC 回复不返回，循环答不上 STATUS_REQUEST，
+# 30s 后 watchdog 杀掉引擎（实测 18/23/29 行 3/3 致命，35/36/55/64/120 行 0.2–0.7s 正常）。
+# 预热尾部实测 16 行（`input 2,064 · cached 2,048`），离致命下沿只差 2 行；且同一分钟内两个
+# 会话的 `{{current_time}}` 相同 → 前缀命中缓存后未缓存行数就只剩这个尾部。
+# 因此探针尾部必须 >=64 token（约致命区间上限的两倍）：nonce 保证重复预热也不会因前缀
+# 命中缩到小行数，填充散文保证即使前缀全部命中也有 >=64 新行。
+WARMUP_PROBE_MIN_TOKENS = 64
+WARMUP_PROBE_CHARS_PER_TOKEN = 4
+WARMUP_PROBE_TEMPLATE_TOKENS = 10
+WARMUP_PROBE_FILLER = (
+    "Deze technische testaanvraag controleert of het lokale taalmodel bereikbaar "
+    "is en of het een gewone vraag normaal beantwoordt. De inhoud van de vraag "
+    "maakt daarvoor niet uit. "
+)
 
 # 单飞锁：保护下面全部状态
 _LOCK = threading.Lock()
@@ -272,6 +303,38 @@ def _role_of(message) -> str:
     return str(getattr(message, "role", ""))
 
 
+def _estimate_probe_tokens(text: str) -> int:
+    """探针文本的保守 token 估算（混合荷兰语 + chat 模板自带的生成提示）。"""
+    return WARMUP_PROBE_TEMPLATE_TOKENS + len(text) // WARMUP_PROBE_CHARS_PER_TOKEN
+
+
+def build_probe_text(
+    base: Optional[str] = None,
+    min_tokens: Optional[int] = None,
+    nonce: Optional[str] = None,
+) -> str:
+    """构造预热探针：一次性 nonce + 一句自然语言 + 填充散文，凑够 >=64 token 尾部。
+
+    nonce 让重复预热不会因为前缀命中缓存而把未缓存行数缩到致命的小行区间；
+    填充追加在**末尾**，所以真实首轮的前缀命中（probe 之前的部分）不受影响。
+    """
+    floor = WARMUP_PROBE_MIN_TOKENS
+    try:
+        configured = int(min_tokens) if min_tokens is not None else 0
+    except (TypeError, ValueError):
+        configured = 0
+    floor = max(floor, configured)
+    if nonce is None:
+        nonce = "Warmup %s %06x." % (
+            time.strftime("%Y-%m-%dT%H:%M:%S"),
+            random.getrandbits(24),
+        )
+    text = f"{nonce} {str(base or WARMUP_PROBE_TEXT).strip()}"
+    while _estimate_probe_tokens(text) < floor:
+        text = text + " " + WARMUP_PROBE_FILLER
+    return text
+
+
 def _warmup_params(provider, messages, tools, timeout_seconds) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "model": getattr(provider, "model_name", None),
@@ -448,8 +511,11 @@ def schedule_warmup(
     except (TypeError, ValueError):
         pass
 
-    probe_text = cfg.get("probe_text") or WARMUP_PROBE_TEXT
-    request_messages = list(messages) + [{"role": "user", "content": str(probe_text)}]
+    probe_text = build_probe_text(
+        cfg.get("probe_text") or WARMUP_PROBE_TEXT,
+        cfg.get("min_probe_tokens"),
+    )
+    request_messages = list(messages) + [{"role": "user", "content": probe_text}]
     signature = payload_signature(messages, tools)
     key = signature["hash"]
     epoch = turn_epoch()
@@ -484,6 +550,7 @@ def schedule_warmup(
         f"warmup: scheduled hash={key} messages={signature['messages']} "
         f"tools={signature['tools']} chars={signature['chars']} "
         f"payload_messages={len(request_messages)} max_tokens={WARMUP_MAX_TOKENS} "
+        f"probe_chars={len(probe_text)} probe_tokens≈{_estimate_probe_tokens(probe_text)} "
         f"stream=true epoch={epoch} grace_ms={int(grace_seconds * 1000)}"
     )
     thread = threading.Thread(

@@ -325,3 +325,62 @@ def test_trouble_classification():
     assert llm_warmup.is_engine_trouble_error(RuntimeError("native loop did not answer"))
     assert llm_warmup.is_engine_trouble_error(RuntimeError("engine stopped unexpectedly"))
     assert not llm_warmup.is_engine_trouble_error(RuntimeError("bad request"))
+
+
+# --- 探针尾部 >=64 未缓存行（t_ae32b506，机理 t_d5763018）---------------------
+# Splash engine 在未缓存 prefill 行数落在 18–29 行的小区间时同步编译 Metal pipeline，
+# XPC 回复不返回 → 30s 后 watchdog 杀掉引擎。预热尾部本身只有 ~16 行，落在致命带边缘；
+# 同一分钟内两个会话前缀相同（`{{current_time}}` 按会话冻结）时未缓存行数就只剩这个尾部。
+
+FATAL_BAND_LOW = 18  # 实测致命区间下沿
+FATAL_BAND_HIGH = 29  # 实测致命区间上沿
+
+
+def _probe_of(provider):
+    return provider.completions.calls[0]["messages"][-1]["content"]
+
+
+def test_probe_tail_is_clear_of_the_fatal_small_row_band():
+    provider = _Provider()
+    assert llm_warmup.schedule_warmup(provider, MESSAGES, TOOLS, ENABLED) == "scheduled"
+    _wait()
+    probe = _probe_of(provider)
+    tokens = llm_warmup._estimate_probe_tokens(probe)
+    assert tokens >= llm_warmup.WARMUP_PROBE_MIN_TOKENS
+    # 至少是致命区间上限的两倍，并且明显高于它（不是刚好贴边）
+    assert tokens >= 2 * FATAL_BAND_HIGH
+    # 仍然是一句自然语言 + 散文，不是单词探针
+    assert len(probe.split()) >= 20
+
+
+def test_short_configured_probe_text_is_padded_to_the_floor():
+    """运维把 probe_text 写成 'hallo' 也不能退回到致命的小行区间。"""
+    config = {"llm_warmup": dict(ENABLED["llm_warmup"], probe_text="hallo")}
+    provider = _Provider()
+    assert llm_warmup.schedule_warmup(provider, MESSAGES, TOOLS, config) == "scheduled"
+    _wait()
+    probe = _probe_of(provider)
+    assert probe.startswith("Warmup ")
+    assert probe.rstrip().endswith(llm_warmup.WARMUP_PROBE_FILLER.strip()[-20:])
+    assert llm_warmup._estimate_probe_tokens(probe) >= llm_warmup.WARMUP_PROBE_MIN_TOKENS
+
+
+def test_probe_nonce_differs_so_repeat_warmups_never_shrink_to_the_band():
+    """前缀命中缓存时未缓存行数只剩探针尾部；nonce 让它每次都够长。"""
+    probes = {llm_warmup.build_probe_text() for _ in range(5)}
+    assert len(probes) == 5
+    for probe in probes:
+        assert llm_warmup._estimate_probe_tokens(probe) >= 2 * FATAL_BAND_HIGH
+
+
+def test_min_probe_tokens_config_can_raise_but_not_lower_the_floor():
+    config = {"llm_warmup": dict(ENABLED["llm_warmup"], min_probe_tokens=256)}
+    provider = _Provider()
+    assert llm_warmup.schedule_warmup(provider, MESSAGES, TOOLS, config) == "scheduled"
+    _wait()
+    assert llm_warmup._estimate_probe_tokens(_probe_of(provider)) >= 250
+    # 低于地板的值被忽略，不会把探针缩回致命带
+    assert (
+        llm_warmup._estimate_probe_tokens(llm_warmup.build_probe_text(min_tokens=4))
+        >= llm_warmup.WARMUP_PROBE_MIN_TOKENS
+    )
