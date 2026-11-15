@@ -253,3 +253,75 @@ def test_turn_counter_never_goes_negative():
     assert llm_warmup.is_busy() is True
     llm_warmup.mark_turn_end()
     assert llm_warmup.is_busy() is False
+
+
+# --- 引擎故障退避（t_ae32b506）---------------------------------------------
+# 实测：一个 18 token 的请求把 Splash native loop 卡死后，后续 2k 预热排在它后面，
+# 30s 后 watchdog 杀掉引擎，真实轮次一起 503。所以引擎一报故障，预热必须停发。
+
+
+class _Boom:
+    """create() 直接抛错，消息里带引擎故障标记。"""
+
+    def __init__(self, message):
+        self.message = message
+        self.calls = []
+
+    def create(self, **params):
+        self.calls.append(params)
+        raise RuntimeError(self.message)
+
+
+def test_warmup_failure_with_engine_trouble_starts_backoff():
+    provider = _Provider()
+    boom = _Boom("APIError: engine_recovering; retry shortly")
+    provider.client.chat.completions = boom
+    assert llm_warmup.schedule_warmup(provider, MESSAGES, TOOLS, ENABLED) == "scheduled"
+    _wait()
+    assert llm_warmup.engine_backoff_remaining() > 0
+    # 退避期内不再发请求
+    assert llm_warmup.schedule_warmup(provider, MESSAGES, TOOLS, ENABLED) == "engine-backoff"
+    assert len(boom.calls) == 1
+
+
+def test_plain_failure_does_not_start_backoff():
+    """参数错之类的失败不是引擎故障，不能因此停掉预热。"""
+    provider = _Provider()
+    provider.client.chat.completions = _Boom("BadRequestError: 400 unknown field")
+    assert llm_warmup.schedule_warmup(provider, MESSAGES, TOOLS, ENABLED) == "scheduled"
+    _wait()
+    assert llm_warmup.engine_backoff_remaining() == 0
+    assert llm_warmup.schedule_warmup(provider, MESSAGES, TOOLS, ENABLED) == "scheduled"
+
+
+def test_backoff_blocks_warmup_then_engine_ok_clears_it():
+    llm_warmup.note_engine_trouble("Splash returned HTTP 503 runtime_unavailable")
+    assert llm_warmup.schedule_warmup(_Provider(), MESSAGES, TOOLS, ENABLED) == "engine-backoff"
+    llm_warmup.note_engine_ok()
+    assert llm_warmup.engine_backoff_remaining() == 0
+    assert llm_warmup.schedule_warmup(_Provider(), MESSAGES, TOOLS, ENABLED) == "scheduled"
+
+
+def test_backoff_expires_and_is_capped():
+    old_base, old_max = llm_warmup._BACKOFF_BASE, llm_warmup._BACKOFF_MAX
+    llm_warmup._BACKOFF_BASE, llm_warmup._BACKOFF_MAX = 1.0, 3.0
+    try:
+        llm_warmup.note_engine_trouble("x")
+        first = llm_warmup.engine_backoff_remaining()
+        llm_warmup.note_engine_trouble("x")
+        second = llm_warmup.engine_backoff_remaining()
+        for _ in range(4):
+            llm_warmup.note_engine_trouble("x")
+        capped = llm_warmup.engine_backoff_remaining()
+        assert 0.5 < first <= 1.0
+        assert 1.5 < second <= 2.0
+        assert 2.5 < capped <= 3.0
+        assert llm_warmup.engine_backoff_streak() == 6
+    finally:
+        llm_warmup._BACKOFF_BASE, llm_warmup._BACKOFF_MAX = old_base, old_max
+
+
+def test_trouble_classification():
+    assert llm_warmup.is_engine_trouble_error(RuntimeError("native loop did not answer"))
+    assert llm_warmup.is_engine_trouble_error(RuntimeError("engine stopped unexpectedly"))
+    assert not llm_warmup.is_engine_trouble_error(RuntimeError("bad request"))

@@ -205,8 +205,11 @@ class LLMProvider(LLMProviderBase):
         first_token_logged = False
         try:
             stream = self.client.chat.completions.create(**request_params)
-        except Exception:
+        except Exception as exc:
             llm_warmup.mark_turn_end()
+            if llm_warmup.is_engine_trouble_error(exc):
+                # 真实轮次已经证明引擎卡住/不可用：让后续预热退让（t_ae32b506）
+                llm_warmup.note_engine_trouble(f"{type(exc).__name__}: {exc}")
             raise
 
         try:
@@ -235,6 +238,13 @@ class LLMProvider(LLMProviderBase):
                         f"输出 {getattr(usage_info, 'completion_tokens', '未知')}，"
                         f"共计 {getattr(usage_info, 'total_tokens', '未知')}"
                     )
+        except Exception as exc:
+            if llm_warmup.is_engine_trouble_error(exc):
+                # 流到一半引擎挂了（engine_recovering / runtime_unavailable）
+                llm_warmup.note_engine_trouble(f"{type(exc).__name__}: {exc}")
+            raise
         finally:
             stream.close()
             llm_warmup.mark_turn_end()
+        # 整个流正常走完：引擎是健康的，解除预热退避（t_ae32b506）
+        llm_warmup.note_engine_ok()

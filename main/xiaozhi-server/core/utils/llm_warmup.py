@@ -17,6 +17,11 @@
   messages 完全相同（同一 system、同一 few-shot、同一 tools），并记录哈希/字符数以便审计；
 - 引擎 max_concurrent_requests=1：发请求前（含调度后的宽限期）再检查一次是否有真实
   轮次在途，流式生成过程中若真实轮次开始则立即放弃读取，避免占住唯一的引擎槽位；
+- **引擎一旦报故障就退让（t_ae32b506）**：`engine_recovering` / `runtime_unavailable`
+  / 5xx / RemoteProtocolError / 超时 都说明 native loop 已经卡住，此时再发预热只会
+  排在卡死的请求后面（实测：18 token 的小请求把 loop 卡死后，2k 预热排队 30s，
+  随后 watchdog 杀掉引擎）。因此记一个指数退避截止时间，期间任何预热直接跳过；
+  真实轮次成功后再清除退避。预热自身失败也计入故障；
 - 超时（timeout_seconds）后放弃；
 - 任何失败只记日志，绝不影响会话。
 
@@ -24,8 +29,10 @@
     llm_warmup:
       enable: true
       max_age_seconds: 300
-      timeout_seconds: 15
+      timeout_seconds: 8      # 小于引擎 30s watchdog，别占着卡死的槽位
       grace_seconds: 1.0     # 调度后给用户/真实轮次让路的宽限时间
+      backoff_seconds: 30    # 引擎报故障后停发预热的初始时长
+      backoff_max_seconds: 300
 """
 
 import hashlib
@@ -64,6 +71,22 @@ _INFLIGHT = 0
 _TURN_EPOCH = 0
 # 预热线程句柄（仅用于测试/观测）
 _LAST_THREAD: Optional[threading.Thread] = None
+# 引擎故障退避（t_ae32b506）：monotonic 截止时间与连续故障次数
+_ENGINE_BACKOFF_UNTIL = 0.0
+_ENGINE_BACKOFF_STREAK = 0
+_ENGINE_LAST_TROUBLE: Optional[str] = None
+# 退避参数：遇到配置时由 _read_config 覆盖
+_BACKOFF_BASE = 30.0
+_BACKOFF_MAX = 300.0
+
+# 引擎"已经卡住"的征兆。命中即退避：此时发预热只会排在卡死的 native loop 后面。
+ENGINE_TROUBLE_MARKERS = (
+    "engine_recovering",
+    "runtime_unavailable",
+    "engine stopped unexpectedly",
+    "native loop did not answer",
+    "recovering; retry shortly",
+)
 
 STATUS_DISABLED = "disabled"
 STATUS_UNSUPPORTED = "unsupported"
@@ -71,6 +94,8 @@ STATUS_RUNNING = "running"
 STATUS_RECENT = "recent"
 STATUS_BUSY = "busy"
 STATUS_SCHEDULED = "scheduled"
+STATUS_BACKOFF = "engine-backoff"
+STATUS_FAILED = "failed"
 
 
 def mark_turn_start() -> None:
@@ -97,6 +122,76 @@ def is_busy() -> bool:
 def turn_epoch() -> int:
     with _LOCK:
         return _TURN_EPOCH
+
+
+def _classify_trouble(text: str) -> Optional[str]:
+    low = (text or "").lower()
+    for marker in ENGINE_TROUBLE_MARKERS:
+        if marker in low:
+            return marker
+    return None
+
+
+def note_engine_trouble(reason: str) -> float:
+    """引擎报故障/卡住时调用（预热失败或真实轮次失败）。
+
+    记录指数退避截止时间：退避期内任何预热都不发，避免把自己的请求排到已经卡死的
+    native loop 后面 —— 那正是 t_ae32b506 里引擎被 30s watchdog 杀掉、真实轮次
+    跟着变成 503 的放大路径。返回退避截止的 monotonic 时间。
+    """
+    global _ENGINE_BACKOFF_UNTIL, _ENGINE_BACKOFF_STREAK, _ENGINE_LAST_TROUBLE
+    with _LOCK:
+        _ENGINE_BACKOFF_STREAK += 1
+        _ENGINE_LAST_TROUBLE = str(reason)[:200]
+        delay = min(_BACKOFF_BASE * (2 ** (_ENGINE_BACKOFF_STREAK - 1)), _BACKOFF_MAX)
+        _ENGINE_BACKOFF_UNTIL = time.monotonic() + delay
+        streak = _ENGINE_BACKOFF_STREAK
+        text = _ENGINE_LAST_TROUBLE
+    logger.bind(tag=TAG).info(
+        f"warmup: engine backoff seconds={delay:.0f} streak={streak} reason={text[:120]}"
+    )
+    return _ENGINE_BACKOFF_UNTIL
+
+
+def note_engine_ok() -> None:
+    """引擎正常响应后调用：清除退避，下次会话可以正常预热。"""
+    global _ENGINE_BACKOFF_UNTIL, _ENGINE_BACKOFF_STREAK, _ENGINE_LAST_TROUBLE
+    with _LOCK:
+        had = _ENGINE_BACKOFF_STREAK
+        _ENGINE_BACKOFF_UNTIL = 0.0
+        _ENGINE_BACKOFF_STREAK = 0
+        _ENGINE_LAST_TROUBLE = None
+    if had:
+        logger.bind(tag=TAG).info(f"warmup: engine backoff cleared (was streak={had})")
+
+
+def engine_backoff_remaining() -> float:
+    with _LOCK:
+        return max(0.0, _ENGINE_BACKOFF_UNTIL - time.monotonic())
+
+
+def engine_backoff_streak() -> int:
+    with _LOCK:
+        return _ENGINE_BACKOFF_STREAK
+
+
+def _is_engine_trouble(exc: Exception) -> bool:
+    """区分"引擎卡住/不可用"与"这次预热本身没意义"（例如 400 参数错）。"""
+    text = f"{type(exc).__name__}: {exc}"
+    if _classify_trouble(text):
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status >= 500:
+        return True
+    low = text.lower()
+    if "timeout" in low or "timed out" in low:
+        return True
+    return "connection" in type(exc).__name__.lower()
+
+
+def is_engine_trouble_error(exc: Exception) -> bool:
+    """供真实轮次调用：这次失败是否说明引擎卡住/不可用。"""
+    return _is_engine_trouble(exc)
 
 
 def prompt_hash(messages: List[Dict[str, Any]], tools: Optional[List[Dict]]) -> str:
@@ -290,8 +385,13 @@ def _do_warmup(provider, params, key, timeout_seconds, epoch, grace_seconds) -> 
         )
         with _LOCK:
             _WARMED[key] = time.monotonic()
+        # 引擎这次答上了：解除退避（t_ae32b506）
+        note_engine_ok()
     except Exception as exc:  # noqa: BLE001 - 预热失败必须静默
         log.info(f"warmup: failed hash={key} {type(exc).__name__}: {exc}")
+        # 引擎卡住/不可用就退让，别再往已经卡死的 native loop 后面排队
+        if _is_engine_trouble(exc):
+            note_engine_trouble(f"{type(exc).__name__}: {exc}")
     finally:
         with _LOCK:
             _RUNNING = False
@@ -338,11 +438,31 @@ def schedule_warmup(
     except (TypeError, ValueError):
         grace_seconds = 1.0
 
+    global _BACKOFF_BASE, _BACKOFF_MAX
+    try:
+        _BACKOFF_BASE = float(cfg.get("backoff_seconds", _BACKOFF_BASE) or _BACKOFF_BASE)
+    except (TypeError, ValueError):
+        pass
+    try:
+        _BACKOFF_MAX = float(cfg.get("backoff_max_seconds", _BACKOFF_MAX) or _BACKOFF_MAX)
+    except (TypeError, ValueError):
+        pass
+
     probe_text = cfg.get("probe_text") or WARMUP_PROBE_TEXT
     request_messages = list(messages) + [{"role": "user", "content": str(probe_text)}]
     signature = payload_signature(messages, tools)
     key = signature["hash"]
     epoch = turn_epoch()
+
+    # 引擎刚报过故障（engine_recovering / runtime_unavailable / 卡死超时）：
+    # 此时发预热只会排到卡死的 native loop 后面，直接跳过（t_ae32b506）。
+    remaining = engine_backoff_remaining()
+    if remaining > 0:
+        log.info(
+            f"warmup: skip reason=engine-backoff remaining_s={remaining:.0f} "
+            f"streak={engine_backoff_streak()} hash={key}"
+        )
+        return STATUS_BACKOFF
 
     with _LOCK:
         if _INFLIGHT > 0:
@@ -381,9 +501,13 @@ def schedule_warmup(
 def reset_state() -> None:
     """仅供测试：清空预热状态。"""
     global _RUNNING, _INFLIGHT, _LAST_THREAD, _TURN_EPOCH
+    global _ENGINE_BACKOFF_UNTIL, _ENGINE_BACKOFF_STREAK, _ENGINE_LAST_TROUBLE
     with _LOCK:
         _WARMED.clear()
         _RUNNING = False
         _INFLIGHT = 0
         _TURN_EPOCH = 0
         _LAST_THREAD = None
+        _ENGINE_BACKOFF_UNTIL = 0.0
+        _ENGINE_BACKOFF_STREAK = 0
+        _ENGINE_LAST_TROUBLE = None
