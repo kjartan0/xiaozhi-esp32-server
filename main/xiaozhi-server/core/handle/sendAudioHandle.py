@@ -10,6 +10,7 @@ from core.utils import textUtils
 from core.utils.util import audio_to_data
 from core.providers.tts.dto.dto import SentenceType
 from core.utils.audioRateController import AudioRateController
+from core.utils import turn_timer
 
 TAG = __name__
 AUDIO_FRAME_DURATION = 60  # 音频帧时长（毫秒），与 Opus 编码 60ms/帧对齐
@@ -20,6 +21,10 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
     # 跳过旧句子残留音频
     if sentence_id is not None and sentence_id != conn.sentence_id:
         return
+
+    # turnbudget t3：本轮首段音频下发（一轮只输出一行，轮外音频自动忽略）
+    if sentenceType == SentenceType.FIRST:
+        turn_timer.mark_first_audio(conn, text)
 
     if conn.tts.tts_audio_first_sentence:
         conn.logger.bind(tag=TAG).info(f"发送第一段语音: {text}")

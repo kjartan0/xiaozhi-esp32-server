@@ -18,6 +18,7 @@ from core.handle.receiveAudioHandle import startToChat
 from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
 from core.handle.receiveAudioHandle import handleAudioMessage
+from core.utils import turn_timer
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -67,8 +68,10 @@ class ASRProviderBase(ABC):
             conn.asr_audio.append(pcm_frame)
 
             # 如果没有语音，且之前也没有声音，缓存部分音频
+            # 一帧为 60ms，保留 20 帧 = 1.2s 预录，避免 VAD 触发时切掉句首轻声字
+            # （上游 xiaozhi-server 系实现的同类修复同样保留约 1.2s）
             if not audio_have_voice and not conn.client_have_voice:
-                conn.asr_audio = conn.asr_audio[-10:]
+                conn.asr_audio = conn.asr_audio[-20:]
                 return
 
             # 自动模式下通过VAD检测到语音停止时触发识别
@@ -84,6 +87,8 @@ class ASRProviderBase(ABC):
     async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes]):
         """并行处理ASR和声纹识别"""
         try:
+            # turnbudget t0：用户停止说话，一轮开始（不影响后续控制流）
+            turn_timer.start_turn(conn)
             total_start_time = time.monotonic()
 
             # 数据已经是PCM直接使用
@@ -166,6 +171,8 @@ class ASRProviderBase(ABC):
             if text_len > 0:
                 audio_snapshot = asr_audio_task.copy()
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
+                # turnbudget t1：ASR 文本可用
+                turn_timer.mark_asr(conn, enhanced_text)
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)
         except Exception as e:

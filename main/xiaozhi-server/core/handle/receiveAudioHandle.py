@@ -10,6 +10,7 @@ from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
+from core.utils import turn_timer
 
 TAG = __name__
 
@@ -41,6 +42,9 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
 
 
 async def startToChat(conn: "ConnectionHandler", text):
+    # turnbudget：文本轮（无 ASR 阶段）在这里补 t0/t1；ASR 轮保留 handle_voice_stop 打的点
+    turn_timer.start_turn(conn)
+    turn_timer.mark_asr(conn, text)
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     actual_text = text
