@@ -34,6 +34,28 @@ logger = setup_logging()
 DEFAULT_FIRST_CHUNK_MAX_WORDS = 8
 MIN_FIRST_CHUNK_MAX_WORDS = 3
 
+# 段结束标点（流式切分用，按出现位置取最早者可切处）。
+# "." 与 "…" 是荷兰语/英语等拉丁语系句末的主要标记（t_78fef7de）；CJK 标点保持原样。
+SENTENCE_END_PUNCTUATIONS = (
+    "。",
+    "？",
+    "?",
+    "！",
+    "!",
+    "；",
+    ";",
+    "：",
+    ".",
+    "…",
+)
+# 首段额外接受的“软”断点：逗号类可以把首包提前发出（句末标点当然也可以）。
+FIRST_SENTENCE_EXTRA_PUNCTUATIONS = (
+    "，",
+    "~",
+    "、",
+    ",",
+)
+
 
 class TTSProviderBase(ABC):
     def __init__(self, config, delete_audio_file):
@@ -86,29 +108,13 @@ class TTSProviderBase(ABC):
         # 流式滑动窗口：待匹配的缓存文本
         self._pending_prefix = ""
         self.tts_text_buff = []
-        self.punctuations = (
-            "。",
-            "？",
-            "?",
-            "！",
-            "!",
-            "；",
-            ";",
-            "：",
-        )
+        # 句子结束标点：只有这些标点能结束一段（其余文本等流式继续累积）。
+        # "."/"…" 让荷兰语等拉丁语系的句子句末也能真正结束一段（t_78fef7de）：
+        # 此前首段只能靠 first_chunk_max_words(8) 或 , ? ! ; : 切开，句末的 "."
+        # 无法切分，一句 3 个词的荷兰语句子仍会被吞进 8 词上限的首段。
+        self.punctuations = SENTENCE_END_PUNCTUATIONS
         self.first_sentence_punctuations = (
-            "，",
-            "~",
-            "、",
-            ",",
-            "。",
-            "？",
-            "?",
-            "！",
-            "!",
-            "；",
-            ";",
-            "：",
+            FIRST_SENTENCE_EXTRA_PUNCTUATIONS + SENTENCE_END_PUNCTUATIONS
         )
         self.tts_stop_request = False
         self.processed_chars = 0
@@ -607,6 +613,18 @@ class TTSProviderBase(ABC):
                 return False
         return True
 
+    @staticmethod
+    def _is_decimal_point(text: str, pos: int) -> bool:
+        """小数点/千位分隔符不是句子边界（荷兰语 "1.000"、模型常写的 "21.5"）。
+
+        只有紧跟在数字后面、且后一个字符是数字（或还没流到）的 "." 才被排除：
+        后一个字符尚未到达时先不切分，等下一块文本；真正的句末数字（"Het is 21. Volgende"）
+        后面是空格，照常切分。
+        """
+        if text[pos] != "." or pos == 0 or not text[pos - 1].isdigit():
+            return False
+        return pos + 1 >= len(text) or text[pos + 1].isdigit()
+
     @classmethod
     def _quote_safe_cut(cls, text: str, pos: int, punctuations) -> int:
         """避免在引号内切分（如 「わぁ！」って / “好！”他说）。
@@ -618,7 +636,11 @@ class TTSProviderBase(ABC):
             # 全文不含引号/括号：不存在未闭合引号，右引号也无需携带，候选位置必然安全
             return pos
         candidates = [pos] + [
-            i for i, ch in enumerate(text) if i > pos and ch in punctuations
+            i
+            for i, ch in enumerate(text)
+            if i > pos
+            and ch in punctuations
+            and not cls._is_decimal_point(text, i)
         ]
         for candidate in candidates:
             end = candidate + 1
@@ -696,7 +718,9 @@ class TTSProviderBase(ABC):
         # 取每种标点最后出现位置的最早者作为切分点（与逐个 rfind 再取最小值等价）
         last_seen = {}
         for i, ch in enumerate(current_text):
-            if ch in punctuations_to_use:
+            if ch in punctuations_to_use and not self._is_decimal_point(
+                current_text, i
+            ):
                 last_seen[ch] = i
         last_punct_pos = min(last_seen.values(), default=-1)
 

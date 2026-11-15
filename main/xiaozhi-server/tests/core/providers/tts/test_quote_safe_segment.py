@@ -1,7 +1,11 @@
 """TTSProviderBase._get_segment_text must not cut sentences inside quotes."""
 import pytest
 
-from core.providers.tts.base import TTSProviderBase
+from core.providers.tts.base import (
+    FIRST_SENTENCE_EXTRA_PUNCTUATIONS,
+    SENTENCE_END_PUNCTUATIONS,
+    TTSProviderBase,
+)
 
 
 # 最小 stub：仅需满足抽象方法实例化要求；object.__new__ 会绕过
@@ -13,8 +17,11 @@ class _TTS(TTSProviderBase):
 
 def _segments(text, step, first_sentence=False):
     tts = object.__new__(_TTS)
-    tts.punctuations = ("。", "？", "?", "！", "!", "；", ";", "：")
-    tts.first_sentence_punctuations = ("，", "~", "、", ",") + tts.punctuations
+    # 用生产常量，避免测试里的标点表与 base.py 漂移（t_78fef7de）
+    tts.punctuations = SENTENCE_END_PUNCTUATIONS
+    tts.first_sentence_punctuations = (
+        FIRST_SENTENCE_EXTRA_PUNCTUATIONS + SENTENCE_END_PUNCTUATIONS
+    )
     tts.tts_text_buff, tts.processed_chars = [], 0
     tts.is_first_sentence, tts.tts_stop_request = first_sentence, False
     out = []
@@ -69,8 +76,9 @@ _GOPEN, _GCLOSE = "\u201e", "\u201c"  # „ “ 德语低引号
 @pytest.mark.parametrize("step", [1, 4])
 def test_guillemets_are_not_split(step):
     # ！ 位于 «» 内，须等右书名号闭合后在句尾标点处切分
+    # （t_78fef7de：句末 "." 现在是切点，走正常段路径，尾句号被 textUtils 去掉）
     text = "Il a dit " + _LQ + "Bonjour ! " + _RQ + " puis est parti."
-    assert _segments(text, step) == [text]
+    assert _segments(text, step) == [text.rstrip(".")]
 
 
 @pytest.mark.parametrize("step", [1, 4])
@@ -112,8 +120,9 @@ def test_nested_mixed_quotes_stay_whole():
 
 def test_apostrophes_do_not_block_splitting():
     # 单引号有撇号歧义（don't），不得纳入平衡检查导致整句延迟
-    # 注：flush 段（stop 时剩余文本）原样输出，不做 strip
-    assert _segments("don't! It's fine.", 1) == ["don't", " It's fine."]
+    # t_78fef7de：句末 "." 现在是切点，第二段走正常段路径（首尾标点被 textUtils 去掉），
+    # 不再依赖 stop flush 保留原样文本
+    assert _segments("don't! It's fine.", 1) == ["don't", "It's fine"]
 
 
 def test_first_sentence_still_splits_at_comma():
