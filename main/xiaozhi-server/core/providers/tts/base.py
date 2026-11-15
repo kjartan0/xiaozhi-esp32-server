@@ -8,6 +8,7 @@ import threading
 import traceback
 
 from core.utils import p3
+from core.utils import turn_timer
 from datetime import datetime
 from core.utils import textUtils
 from typing import Callable, Any, Optional
@@ -28,6 +29,10 @@ from core.providers.tts.dto.dto import (
 
 TAG = __name__
 logger = setup_logging()
+
+# 首段词数上限的默认值与下限（见 TTSProviderBase._first_chunk_max_words）
+DEFAULT_FIRST_CHUNK_MAX_WORDS = 8
+MIN_FIRST_CHUNK_MAX_WORDS = 3
 
 
 class TTSProviderBase(ABC):
@@ -108,6 +113,27 @@ class TTSProviderBase(ABC):
         self.tts_stop_request = False
         self.processed_chars = 0
         self.is_first_sentence = True
+        # 首段最大词数：标点切分超出该词数时退化为词边界切分，0 表示禁用。
+        # 目的：TTS 首包受首句长度线性拖累（实测 284 字符无标点句 → 4.4s），
+        # 词边界兜底把首段压到稳定长度，剩余文本照常流式切分。
+        self._first_chunk_max_words = self._resolve_first_chunk_max_words(config)
+
+    @staticmethod
+    def _resolve_first_chunk_max_words(config) -> int:
+        """解析 first_chunk_max_words：缺省 8，最小 3，0（或负数）禁用。"""
+        raw = (config or {}).get("first_chunk_max_words", None)
+        if raw is None:
+            return DEFAULT_FIRST_CHUNK_MAX_WORDS
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.bind(tag=TAG).warning(
+                f"first_chunk_max_words 配置非法({raw!r})，回退默认值 {DEFAULT_FIRST_CHUNK_MAX_WORDS}"
+            )
+            return DEFAULT_FIRST_CHUNK_MAX_WORDS
+        if value <= 0:
+            return 0
+        return max(MIN_FIRST_CHUNK_MAX_WORDS, value)
 
     def generate_filename(self, extension=".wav"):
         return os.path.join(
@@ -123,6 +149,8 @@ class TTSProviderBase(ABC):
         self.before_stop_play_files.append((file_audio, text))
 
     def to_tts_stream(self, text, opus_handler: Callable[[bytes], None] = None) -> None:
+        # turnbudget t2：首句文本交付 TTS provider（每轮只记第一次）
+        turn_timer.mark_tts(getattr(self, "conn", None), text)
         # 保留原始文本用于显示/上报
         original_text = text
         text = MarkdownCleaner.clean_markdown(text)
@@ -504,6 +532,18 @@ class TTSProviderBase(ABC):
     _QUOTE_CHARS = "".join(ch for pair in _QUOTE_PAIRS for ch in pair)
 
     @classmethod
+    def _is_quote_balanced(cls, segment: str) -> bool:
+        """引号/括号是否成对闭合（计数法，〝同符引号〞用奇偶检测）。"""
+        for opener, closer in cls._QUOTE_PAIRS:
+            n_open = segment.count(opener)
+            if opener == closer:
+                if n_open % 2:
+                    return False
+            elif n_open > segment.count(closer):
+                return False
+        return True
+
+    @classmethod
     def _quote_safe_cut(cls, text: str, pos: int, punctuations) -> int:
         """避免在引号内切分（如 「わぁ！」って / “好！”他说）。
 
@@ -526,24 +566,55 @@ class TTSProviderBase(ABC):
                     carried_closer = True
                 end += 1
             segment = text[:end]
-            # 前后配对的引号（「」等）用计数差检测；前后同符的引号（"）用奇偶检测
-            balanced = True
-            for opener, closer in cls._QUOTE_PAIRS:
-                n_open = segment.count(opener)
-                if opener == closer:
-                    if n_open % 2:
-                        balanced = False
-                        break
-                elif n_open > segment.count(closer):
-                    balanced = False
-                    break
-            if not balanced:
+            if not cls._is_quote_balanced(segment):
                 continue
             if carried_closer and (end == len(text) or not text[end].isspace()):
                 # 右引号之后句子还在继续（「…」って、“…”他说），或暂时看不到后文
                 continue
             return end - 1
         return -1
+
+    def _first_chunk_word_cut(self, text: str, max_words: int) -> int:
+        """首段兜底切分：满 max_words 个完整词后按词边界切开。
+
+        返回本次切分的结束下标（含该下标字符，即第 N 个词后的分隔符），-1 表示
+        当前文本还找不到安全词边界（词未完整、或引号未闭合、或全文没有空白分词）。
+        引号未闭合的候选顺延到下一个词边界，最多尝试 2×max_words 个词。
+        """
+        idx = 0
+        count = 0
+        length = len(text)
+        limit = max_words * 2
+        while idx < length and count < limit:
+            while idx < length and text[idx].isspace():
+                idx += 1
+            if idx >= length:
+                break
+            while idx < length and not text[idx].isspace():
+                idx += 1
+            count += 1
+            # idx 指向词后的分隔符；词完整且引号闭合才切
+            if count >= max_words and idx < length and self._is_quote_balanced(text[:idx]):
+                return idx
+        return -1
+
+    def _cap_first_chunk(self, text: str, punct_cut: int) -> int:
+        """首段长度上限：标点落在窗口内仍用标点，否则退化为词边界切分。
+
+        目的：TTS 首包延迟随首句长度线性增长（284 字符无标点句 → 4.4s），
+        首段压到 max_words 个词后，剩余文本照常按原逻辑流式切分。
+        """
+        max_words = getattr(self, "_first_chunk_max_words", 0)
+        if not max_words or not self.is_first_sentence:
+            return punct_cut
+        if punct_cut != -1 and len(re.findall(r"\S+", text[: punct_cut + 1])) <= max_words:
+            return punct_cut
+        word_cut = self._first_chunk_word_cut(text, max_words)
+        if word_cut == -1:
+            return punct_cut
+        if punct_cut == -1:
+            return word_cut
+        return min(word_cut, punct_cut)
 
     def _get_segment_text(self) -> Optional[str]:
         # 合并当前全部文本并处理未分割部分
@@ -570,6 +641,9 @@ class TTSProviderBase(ABC):
             cut_pos = self._quote_safe_cut(
                 current_text, last_punct_pos, punctuations_to_use
             )
+        if self.is_first_sentence:
+            # 首段上限：标点超出窗口时退化为词边界切分（first_chunk_max_words）
+            cut_pos = self._cap_first_chunk(current_text, cut_pos)
         if cut_pos != -1:
             segment_text_raw = current_text[: cut_pos + 1]
             segment_text = textUtils.get_string_no_punctuation_or_emoji(
