@@ -9,7 +9,10 @@
 三个探针都按线上配置构造与真实请求一致的载荷：
   TTS  POST <url>  {"input": "Hallo.", ...}（custom 类型，{prompt_text} 替换）
   ASR  POST <base_url> multipart file=1s/16kHz 静音 WAV + model/language
-  LLM  POST <base_url>/chat/completions  max_tokens=8 + chat_template_kwargs
+  LLM  POST <base_url>/chat/completions  max_tokens=8 + chat_template_kwargs，
+       请求内容是 build_probe_text() 的 >=64 token 探针（一次性 nonce + 一句自然语言
+       + 填充散文）。裸的小探针（旧版 ~20 token）落在 Splash 的 17–31 行致命带里，
+       会把引擎卡死 30s（ADR-022 / t_3efccbba）。
 
 全部使用 httpx.AsyncClient，不阻塞事件循环。
 """
@@ -33,11 +36,21 @@ if __package__ in (None, ""):
 import httpx
 
 from config.logger import setup_logging
+from core.utils.llm_warmup import (
+    WARMUP_PROBE_MIN_TOKENS,
+    build_probe_text,
+    estimate_probe_tokens,
+)
 
 TAG = "warmup"
 
 TTS_PROBE_TEXT = "Hallo."
+# LLM 探针的“自然语言那一句”。它只是探针主体：真正的请求内容由 build_probe_text()
+# 在前面加一次性 nonce、在后面加填充散文，凑够 >=64 个未缓存 prefill 行（见 _probe_llm）。
 LLM_PROBE_PROMPT = "Zeg alleen het woord hallo."
+# 探针尾部的最小未缓存 prefill 行数（ADR-022 / t_3efccbba）：17–31 行是 Splash 引擎的
+# 致命带（121 deaths / 1 completion），旧的 20 token 探针正好落在里面。
+LLM_PROBE_MIN_TOKENS = WARMUP_PROBE_MIN_TOKENS
 LLM_PROBE_MAX_TOKENS = 8
 ASR_PROBE_SECONDS = 1.0
 ASR_PROBE_RATE = 16000
@@ -45,7 +58,9 @@ ASR_PROBE_RATE = 16000
 # 单个探针的超时（秒）：ASR 首次请求会加载 GGUF 模型，给足时间
 TTS_TIMEOUT = 60.0
 ASR_TIMEOUT = 120.0
-LLM_TIMEOUT = 60.0
+# LLM 探针的超时留在引擎 30s watchdog 之下：探针卡住时不要占着唯一的引擎槽位
+# （与 core/utils/llm_warmup.py 的 timeout_seconds 同一理由）。
+LLM_TIMEOUT = 20.0
 
 logger = setup_logging()
 
@@ -168,9 +183,25 @@ async def _probe_llm(client: httpx.AsyncClient, config: Dict[str, Any]) -> Dict[
     if not base_url:
         return _result(label, False, None, "缺少 base_url")
 
+    # 探针形状（t_3efccbba / ADR-022）：一次性 nonce + 一句自然语言 + 填充散文。
+    # 旧探针是裸的一句 "Zeg alleen het woord hallo."（引擎侧 `input 20 · cached 0`），
+    # 未缓存 prefill 落在 17–31 行的致命带里，每次容器启动都把 Splash native loop
+    # 卡死 30s，引擎再花 ~60s 才回来。build_probe_text() 保证尾部 >=64 token，
+    # 与 core/utils/llm_warmup.py 的会话预热完全同一形状。
+    probe_text = build_probe_text(cfg.get("probe_text") or LLM_PROBE_PROMPT)
+    probe_tokens = estimate_probe_tokens(probe_text)
+    if probe_tokens < LLM_PROBE_MIN_TOKENS:  # build_probe_text 已保证；防御性二次闸门
+        return _result(
+            label,
+            True,
+            None,
+            f"探针 {probe_tokens} token < {LLM_PROBE_MIN_TOKENS}，按 ADR-022 跳过",
+            skipped=True,
+        )
+
     payload: Dict[str, Any] = {
         "model": cfg.get("model_name"),
-        "messages": [{"role": "user", "content": LLM_PROBE_PROMPT}],
+        "messages": [{"role": "user", "content": probe_text}],
         "max_tokens": LLM_PROBE_MAX_TOKENS,
         "stream": False,
     }
@@ -178,6 +209,13 @@ async def _probe_llm(client: httpx.AsyncClient, config: Dict[str, Any]) -> Dict[
     if isinstance(chat_template_kwargs, dict):
         payload.update(chat_template_kwargs)
     headers = {"Authorization": f"Bearer {cfg.get('api_key') or 'local'}"}
+
+    # 一行说明请求形状：下次失败时不必再翻引擎日志才能知道发的是什么。
+    logger.bind(tag=TAG).info(
+        f"warmup_llm: input_tokens~{probe_tokens} chars={len(probe_text)} "
+        f"nonce={probe_text.split()[1] if len(probe_text.split()) > 1 else '-'} "
+        f"max_tokens={LLM_PROBE_MAX_TOKENS} stream=false model={cfg.get('model_name')}"
+    )
 
     started = time.monotonic()
     try:
@@ -189,17 +227,41 @@ async def _probe_llm(client: httpx.AsyncClient, config: Dict[str, Any]) -> Dict[
         )
         elapsed = (time.monotonic() - started) * 1000.0
     except Exception as exc:
+        logger.bind(tag=TAG).warning(
+            f"warmup_llm: failed after {int((time.monotonic() - started) * 1000)}ms "
+            f"{type(exc).__name__}: {exc} (input_tokens~{probe_tokens})"
+        )
         return _result(label, False, None, f"{type(exc).__name__}: {exc}")
 
     if response.status_code != 200:
         return _result(label, False, elapsed, f"HTTP {response.status_code}: {response.text[:200]}")
     try:
-        content = (
-            response.json()["choices"][0]["message"].get("content") or ""
-        ).strip()
+        body = response.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        content = (body["choices"][0]["message"].get("content") or "").strip()
     except Exception:
         content = ""
-    return _result(label, True, elapsed, f"reply={content[:40]!r}")
+    # 引擎侧的真实 prefill 行数（input/cached）比本地估算可信：有就一并记下来。
+    usage = body.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    cached_tokens = (details or {}).get("cached_tokens") if isinstance(details, dict) else None
+    if prompt_tokens is not None:
+        logger.bind(tag=TAG).info(
+            f"warmup_llm: ok input_tokens={prompt_tokens} cached_tokens={cached_tokens} "
+            f"ms={int(elapsed)}"
+        )
+    return _result(
+        label,
+        True,
+        elapsed,
+        f"reply={content[:40]!r} input_tokens={prompt_tokens} "
+        f"cached_tokens={cached_tokens} probe_tokens~{probe_tokens}",
+    )
 
 
 async def _run_once(config: Dict[str, Any]) -> List[Dict[str, Any]]:

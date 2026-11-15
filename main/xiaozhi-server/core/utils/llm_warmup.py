@@ -303,9 +303,17 @@ def _role_of(message) -> str:
     return str(getattr(message, "role", ""))
 
 
-def _estimate_probe_tokens(text: str) -> int:
-    """探针文本的保守 token 估算（混合荷兰语 + chat 模板自带的生成提示）。"""
+def estimate_probe_tokens(text: str) -> int:
+    """探针文本的保守 token 估算（混合荷兰语 + chat 模板自带的生成提示）。
+
+    公开名：`tools/warmup_providers.py` 的容器启动预热必须与这里同一探针形状，
+    两处各自维护估算会让“>=64 未缓存行”的守卫悄悄失配（t_3efccbba）。
+    """
     return WARMUP_PROBE_TEMPLATE_TOKENS + len(text) // WARMUP_PROBE_CHARS_PER_TOKEN
+
+
+# 向后兼容：历史调用点/测试仍用私有名
+_estimate_probe_tokens = estimate_probe_tokens
 
 
 def build_probe_text(
