@@ -18,9 +18,7 @@ GET_NEWS_FROM_CHINANEWS_FUNCTION_DESC = {
     "function": {
         "name": "get_news_from_chinanews",
         "description": (
-            "当用户要求查看或收听新闻时调用（如'来条新闻''今天有什么新闻'）。"
-            "用户可以指定新闻类型，如社会新闻、科技新闻、国际新闻等。"
-            "如果没有指定，默认播报社会新闻。"
+            "当用户要求查看或收听新闻时调用，可指定类别（社会/科技/国际），默认社会新闻。"
         ),
         "parameters": {
             "type": "object",
@@ -35,7 +33,7 @@ GET_NEWS_FROM_CHINANEWS_FUNCTION_DESC = {
                 },
                 "lang": {
                     "type": "string",
-                    "description": "返回用户使用的语言code，例如zh_CN/zh_HK/en_US/ja_JP等，默认zh_CN",
+                    "description": "语言code，如 zh_CN/en_US，默认zh_CN",
                 },
             },
             "required": ["lang"],
