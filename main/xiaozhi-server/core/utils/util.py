@@ -275,16 +275,17 @@ def extract_json_from_string(input_string):
 
 
 def audio_to_data_stream(
-    audio_file_path, is_opus=True, callback: Callable[[Any], Any] = None, sample_rate=16000, opus_encoder=None
-) -> None:
+    audio_file_path, is_opus=True, callback: Callable[[Any], Any] = None, sample_rate=16000, opus_encoder=None,
+    silence_trim=None,
+):
     with _ffmpeg_path_override():
-        _audio_to_data_stream_inner(
-            audio_file_path, is_opus, callback, sample_rate, opus_encoder
+        return _audio_to_data_stream_inner(
+            audio_file_path, is_opus, callback, sample_rate, opus_encoder, silence_trim
         )
 
 
 def _audio_to_data_stream_inner(
-    audio_file_path, is_opus, callback, sample_rate, opus_encoder
+    audio_file_path, is_opus, callback, sample_rate, opus_encoder, silence_trim=None
 ):
     file_type = os.path.splitext(audio_file_path)[1]
     if file_type:
@@ -294,7 +295,7 @@ def _audio_to_data_stream_inner(
         audio_file_path, format=file_type, parameters=["-nostdin"]
     )
     audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
-    pcm_to_data_stream(audio.raw_data, is_opus, callback, sample_rate, opus_encoder)
+    return pcm_to_data_stream(audio.raw_data, is_opus, callback, sample_rate, opus_encoder, silence_trim)
 
 
 async def audio_to_data(
@@ -381,8 +382,9 @@ async def audio_to_data(
 
 
 def audio_bytes_to_data_stream(
-    audio_bytes, file_type, is_opus, callback: Callable[[Any], Any], sample_rate=16000, opus_encoder=None
-) -> None:
+    audio_bytes, file_type, is_opus, callback: Callable[[Any], Any], sample_rate=16000, opus_encoder=None,
+    silence_trim=None,
+):
     """
     直接用音频二进制数据转为opus/pcm数据，支持wav、mp3、p3
     """
@@ -397,10 +399,103 @@ def audio_bytes_to_data_stream(
             )
         audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
         raw_data = audio.raw_data
-        pcm_to_data_stream(raw_data, is_opus, callback, sample_rate, opus_encoder)
+        return pcm_to_data_stream(raw_data, is_opus, callback, sample_rate, opus_encoder, silence_trim)
 
 
-def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = None, sample_rate=16000, opus_encoder=None):
+SILENCE_TRIM_DEFAULTS = {
+    # 保留的自然停顿：短句不会被削掉气口
+    "lead_keep_ms": 80,
+    "trail_keep_ms": 120,
+    # 单段最多裁剪量（防止把整段静音裁没了）
+    "lead_max_trim_ms": 400,
+    "trail_max_trim_ms": 800,
+    # 整段短于该时长时不裁（避免把真正的停顿当填充削掉）
+    "min_chunk_ms": 400,
+    # 静音判定：10ms 帧 RMS，阈值 = max(floor, peak * ratio)
+    # 与 t_f2903196 的 seam_probe.py / t_1cdc72d5 的 measure_delivered.py 完全一致，
+    # 保证前后数字可比。
+    "threshold_floor": 200,
+    "threshold_ratio": 0.05,
+}
+
+
+def trim_pcm_silence(raw_data, sample_rate=16000, config=None):
+    """裁掉 PCM 首尾多余静音，返回 (trimmed_raw_data, stats)。
+
+    t_1cdc72d5：Supertonic 每段固定 ~440-500ms 前导 + ~700-1000ms 尾部静音，
+    实测原样进入下发 opus 流（2 段答案缝处 ~1.0s 连续静音）。这里只裁首尾、
+    且只裁超出保留量的部分；帧内停顿不动，所以不影响韵律。
+
+    stats["applied"]=False 时原样返回，并在 stats["reason"] 说明原因。
+    """
+    cfg = dict(SILENCE_TRIM_DEFAULTS)
+    for key, value in (config or {}).items():
+        if key in cfg and value is not None:
+            cfg[key] = value
+
+    stats = {
+        "applied": False,
+        "reason": None,
+        "duration_ms": 0.0,
+        "lead_ms": None,
+        "trail_ms": None,
+        "lead_cut_ms": 0,
+        "trail_cut_ms": 0,
+    }
+    samples = np.frombuffer(raw_data, dtype=np.int16)
+    if samples.size == 0:
+        stats["reason"] = "empty"
+        return raw_data, stats
+
+    frame_ms = 10
+    frame = max(1, int(sample_rate) * frame_ms // 1000)
+    n_frames = samples.size // frame
+    duration_ms = samples.size * 1000.0 / sample_rate
+    stats["duration_ms"] = round(duration_ms, 1)
+    if n_frames < 2:
+        stats["reason"] = "too_short"
+        return raw_data, stats
+
+    window = samples[: n_frames * frame].astype(np.float32).reshape(n_frames, frame)
+    rms = np.sqrt(np.mean(window * window, axis=1))
+    peak = int(np.max(np.abs(samples.astype(np.int32))))
+    threshold = max(float(cfg["threshold_floor"]), peak * float(cfg["threshold_ratio"]))
+    voiced = np.nonzero(rms >= threshold)[0]
+    if voiced.size == 0:
+        stats["reason"] = "no_voiced_frame"
+        return raw_data, stats
+
+    lead_ms = int(voiced[0]) * frame_ms
+    trail_ms = int(n_frames - 1 - voiced[-1]) * frame_ms
+    stats["lead_ms"] = lead_ms
+    stats["trail_ms"] = trail_ms
+
+    if duration_ms < float(cfg["min_chunk_ms"]):
+        stats["reason"] = "below_min_chunk_ms"
+        return raw_data, stats
+
+    lead_cut = min(lead_ms - int(cfg["lead_keep_ms"]), int(cfg["lead_max_trim_ms"]))
+    trail_cut = min(trail_ms - int(cfg["trail_keep_ms"]), int(cfg["trail_max_trim_ms"]))
+    lead_cut = max(0, lead_cut) // frame_ms * frame_ms
+    trail_cut = max(0, trail_cut) // frame_ms * frame_ms
+    if lead_cut == 0 and trail_cut == 0:
+        stats["reason"] = "nothing_to_trim"
+        return raw_data, stats
+
+    start = lead_cut * int(sample_rate) // 1000
+    end = samples.size - trail_cut * int(sample_rate) // 1000
+    # 兜底：裁完必须还剩一半以上，否则不裁（短段/异常段原样走）
+    if end <= start or (end - start) * 2 < samples.size:
+        stats["reason"] = "would_remove_too_much"
+        return raw_data, stats
+
+    stats["applied"] = True
+    stats["lead_cut_ms"] = lead_cut
+    stats["trail_cut_ms"] = trail_cut
+    return raw_data[start * 2 : end * 2], stats
+
+
+def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = None, sample_rate=16000, opus_encoder=None, silence_trim=None):
     """
     将PCM数据流式编码为Opus或直接输出PCM
 
@@ -410,7 +505,15 @@ def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = 
         callback: 回调函数
         sample_rate: 采样率
         opus_encoder: OpusEncoderUtils对象(推荐提供以保持编码器状态连续)
+        silence_trim: 可选，首尾静音裁剪配置（见 trim_pcm_silence），None/空 表示不裁
+
+    Returns:
+        silence_trim 的统计字典（未启用时 None）
     """
+    trim_stats = None
+    if silence_trim is not None:
+        raw_data, trim_stats = trim_pcm_silence(raw_data, sample_rate, silence_trim)
+
     using_temp_encoder = False
     if is_opus and opus_encoder is None:
         encoder = opuslib_next.Encoder(sample_rate, 1, opuslib_next.APPLICATION_AUDIO)
@@ -443,6 +546,8 @@ def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = 
             # PCM模式,直接输出
             frame_data = chunk if isinstance(chunk, bytes) else bytes(chunk)
             callback(frame_data)
+
+    return trim_stats
 
 
 def opus_datas_to_wav_bytes(opus_datas, sample_rate=16000, channels=1):

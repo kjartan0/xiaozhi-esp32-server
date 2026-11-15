@@ -117,6 +117,66 @@ class TTSProviderBase(ABC):
         # 目的：TTS 首包受首句长度线性拖累（实测 284 字符无标点句 → 4.4s），
         # 词边界兜底把首段压到稳定长度，剩余文本照常流式切分。
         self._first_chunk_max_words = self._resolve_first_chunk_max_words(config)
+        # 首尾静音裁剪（t_1cdc72d5）：Supertonic 每段固定 ~440-500ms 前导 + ~700-1000ms
+        # 尾部静音，实测原样进入下发 opus 流（2 段答案缝处 ~1.0s 连续静音）。
+        # 未配置该块时为 None → 行为完全不变。
+        self.silence_trim = self._resolve_silence_trim(config)
+
+    @staticmethod
+    def _resolve_silence_trim(config):
+        """解析 silence_trim 配置块；缺省/关闭时返回 None（不裁）。"""
+        raw = (config or {}).get("silence_trim", None)
+        if not raw:
+            return None
+        if raw is True:
+            raw = {}
+        if not isinstance(raw, dict):
+            logger.bind(tag=TAG).warning(
+                f"silence_trim 配置非法({raw!r})，按未配置处理"
+            )
+            return None
+        if str(raw.get("enabled", "true")).lower() in ("false", "0", "no"):
+            return None
+        resolved = {}
+        for key in (
+            "lead_keep_ms",
+            "trail_keep_ms",
+            "lead_max_trim_ms",
+            "trail_max_trim_ms",
+            "min_chunk_ms",
+        ):
+            if key not in raw:
+                continue
+            try:
+                value = int(raw[key])
+            except (TypeError, ValueError):
+                logger.bind(tag=TAG).warning(
+                    f"silence_trim.{key} 配置非法({raw[key]!r})，使用默认值"
+                )
+                continue
+            if value < 0:
+                continue
+            resolved[key] = value
+        return resolved
+
+    def _log_silence_trim(self, stats, text=None):
+        """记录一次裁剪的实际效果（INFO 只在真的裁了时打印，便于取证）。"""
+        if not stats:
+            return
+        if stats.get("applied"):
+            logger.bind(tag=TAG).info(
+                "silence_trim: lead {}ms->{}ms trail {}ms->{}ms "
+                "(cut {}/{}ms of {}ms chunk) text={!r}".format(
+                    stats.get("lead_ms"), (stats.get("lead_ms") or 0) - stats.get("lead_cut_ms", 0),
+                    stats.get("trail_ms"), (stats.get("trail_ms") or 0) - stats.get("trail_cut_ms", 0),
+                    stats.get("lead_cut_ms"), stats.get("trail_cut_ms"),
+                    stats.get("duration_ms"), (text or "")[:40],
+                )
+            )
+        else:
+            logger.bind(tag=TAG).debug(
+                f"silence_trim: skip reason={stats.get('reason')} text={(text or '')[:40]!r}"
+            )
 
     @staticmethod
     def _resolve_first_chunk_max_words(config) -> int:
@@ -166,14 +226,16 @@ class TTSProviderBase(ABC):
                     if audio_bytes:
                         # 使用原始文本用于显示/上报
                         self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
-                        audio_bytes_to_data_stream(
+                        stats = audio_bytes_to_data_stream(
                             audio_bytes,
                             file_type=self.audio_file_type,
                             is_opus=True,
                             callback=opus_handler,
                             sample_rate=self.conn.sample_rate,
                             opus_encoder=self.opus_encoder,
+                            silence_trim=self.silence_trim,
                         )
+                        self._log_silence_trim(stats, original_text)
                         break
                     else:
                         max_repeat_time -= 1
@@ -234,13 +296,15 @@ class TTSProviderBase(ABC):
                     audio_bytes = asyncio.run(self.text_to_speak(text, None))
                     if audio_bytes:
                         audio_datas = []
-                        audio_bytes_to_data_stream(
+                        stats = audio_bytes_to_data_stream(
                             audio_bytes,
                             file_type=self.audio_file_type,
                             is_opus=True,
                             callback=lambda data: audio_datas.append(data),
                             sample_rate=self.conn.sample_rate,
+                            silence_trim=self.silence_trim,
                         )
+                        self._log_silence_trim(stats, original_text)
                         return audio_datas
                     else:
                         max_repeat_time -= 1
@@ -295,13 +359,13 @@ class TTSProviderBase(ABC):
         self, audio_file_path, callback: Callable[[Any], Any] = None
     ):
         """音频文件转换为PCM编码"""
-        return audio_to_data_stream(audio_file_path, is_opus=False, callback=callback, sample_rate=self.conn.sample_rate, opus_encoder=None)
+        return audio_to_data_stream(audio_file_path, is_opus=False, callback=callback, sample_rate=self.conn.sample_rate, opus_encoder=None, silence_trim=self.silence_trim)
 
     def audio_to_opus_data_stream(
         self, audio_file_path, callback: Callable[[Any], Any] = None
     ):
         """音频文件转换为Opus编码"""
-        return audio_to_data_stream(audio_file_path, is_opus=True, callback=callback, sample_rate=self.conn.sample_rate, opus_encoder=self.opus_encoder)
+        return audio_to_data_stream(audio_file_path, is_opus=True, callback=callback, sample_rate=self.conn.sample_rate, opus_encoder=self.opus_encoder, silence_trim=self.silence_trim)
 
     def tts_one_sentence(
         self,
