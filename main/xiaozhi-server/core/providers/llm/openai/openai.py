@@ -1,8 +1,11 @@
+import time
+
 import httpx
 import openai
 from openai.types import CompletionUsage
 from config.logger import setup_logging
 from core.utils.util import check_model_key
+from core.utils import llm_warmup
 from core.providers.llm.base import LLMProviderBase
 from urllib.parse import urlparse
 
@@ -195,7 +198,16 @@ class LLMProvider(LLMProviderBase):
             request_params.setdefault("extra_body", {})[
                 "chat_template_kwargs"
             ] = self.chat_template_kwargs
-        stream = self.client.chat.completions.create(**request_params)
+
+        # 本请求在途期间，进程内 LLM 前缀预热必须让路（引擎 max_concurrent_requests=1）
+        llm_warmup.mark_turn_start()
+        request_sent_at = time.monotonic()
+        first_token_logged = False
+        try:
+            stream = self.client.chat.completions.create(**request_params)
+        except Exception:
+            llm_warmup.mark_turn_end()
+            raise
 
         try:
             for chunk in stream:
@@ -203,13 +215,26 @@ class LLMProvider(LLMProviderBase):
                     delta = chunk.choices[0].delta
                     content = getattr(delta, "content", "")
                     tool_calls = getattr(delta, "tool_calls", None)
+                    # 本请求自己的首字时延（t_a5523178 fix 4）：turnbudget 的 llm_to_tts_ms
+                    # 必须能与**同一次请求**的 TTFT 配对，而不是靠猜引擎日志的时间戳。
+                    if not first_token_logged and content:
+                        first_token_logged = True
+                        logger.bind(tag=TAG).info(
+                            f"LLM 首字: ttft_ms={round((time.monotonic() - request_sent_at) * 1000, 1)} "
+                            f"messages={len(dialogue)} tools={len(functions or [])} "
+                            f"max_tokens={request_params.get('max_tokens')}"
+                        )
                     yield content, tool_calls
                 elif isinstance(getattr(chunk, "usage", None), CompletionUsage):
                     usage_info = getattr(chunk, "usage", None)
+                    details = getattr(usage_info, "prompt_tokens_details", None)
+                    cached = getattr(details, "cached_tokens", None)
                     logger.bind(tag=TAG).info(
                         f"Token 消耗：输入 {getattr(usage_info, 'prompt_tokens', '未知')}，"
+                        f"命中 {cached}，"  # 引擎前缀缓存命中数（t_a5523178 审计用）
                         f"输出 {getattr(usage_info, 'completion_tokens', '未知')}，"
                         f"共计 {getattr(usage_info, 'total_tokens', '未知')}"
                     )
         finally:
             stream.close()
+            llm_warmup.mark_turn_end()

@@ -28,6 +28,14 @@ class Dialogue:
         # 获取当前时间
         self.current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _session_hhmm(self) -> str:
+        """会话内恒定的 HH:MM（供 {{current_time}} 使用）。
+
+        引擎前缀缓存逐 token 匹配，提示词里的时间必须在一个会话内保持字节恒定，
+        否则每个跨分钟轮次（以及预热快照 vs 首轮请求）都会整段失效。
+        """
+        return self.current_time[11:16]
+
     def put(self, message: Message):
         self.dialogue.append(message)
 
@@ -106,9 +114,12 @@ class Dialogue:
         if system_message:
             full_prompt = system_message.content
 
-            # 替换时间占位符
+            # 替换时间占位符：用**会话开始时冻结**的时间，而非每轮重新取 now()。
+            # 引擎前缀缓存是逐 token 的：每轮重取会让跨分钟的第 2 轮整体失效
+            # （2,336 cached → 0），也会让预热快照与首轮真实请求不可能是同一字节串
+            # （t_a5523178 fix 2）。self.current_time 在 Dialogue 创建（会话开始）时写入。
             full_prompt = full_prompt.replace(
-                "{{current_time}}", datetime.now().strftime("%H:%M")
+                "{{current_time}}", self._session_hhmm()
             )
 
             # 填充记忆

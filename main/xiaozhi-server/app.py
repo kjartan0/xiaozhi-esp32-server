@@ -11,6 +11,7 @@ from core.websocket_server import WebSocketServer
 from core.utils.util import check_ffmpeg_installed
 from core.utils.gc_manager import get_gc_manager
 from core.handle.helloHandle import preheat_wakeup_audio_cache
+from tools.warmup_providers import warmup_providers
 
 TAG = __name__
 logger = setup_logging()
@@ -67,6 +68,10 @@ async def main():
 
     # 预热唤醒词音频编码缓存，让首条连接就命中
     asyncio.create_task(preheat_wakeup_audio_cache())
+
+    # 预热本地 TTS/ASR/LLM provider，把首轮模型加载开销挪出用户可感知时延
+    # （后台任务，不阻塞启动；失败只记日志，最多 3 次重试）
+    asyncio.create_task(warmup_providers(config))
 
     # 启动全局GC管理器（5分钟清理一次）
     gc_manager = get_gc_manager(interval_seconds=300)

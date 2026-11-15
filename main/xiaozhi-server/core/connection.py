@@ -122,6 +122,12 @@ class ConnectionHandler:
         self.loop = None  # 在 handle_connection 中获取运行中的事件循环
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
+        # 组件初始化完成信号（t_a5523178）：首轮用户消息可能在 _initialize_components
+        # 还没跑完时到达，此时 system prompt 仍是 quick prompt，与预热用的增强 prompt
+        # 不是同一个前缀，缓存永远不可能命中。首轮 chat() 会短暂等待该事件。
+        self._components_ready = threading.Event()
+        # 首轮前缀指纹只打印一次，便于和 warmup 日志逐字比对
+        self._first_turn_prefix_logged = False
 
         # 添加上报线程池
         self.report_queue = queue.Queue()
@@ -652,9 +658,14 @@ class ConnectionHandler:
             self._init_prompt_enhancement()
             """注入工具调用few-shot示例（仅function_call模式）"""
             self._inject_tool_call_fewshot()
+            """预热 LLM 前缀缓存（后台线程，用户开口前把 system+tools+few-shot 写进引擎缓存）"""
+            self._schedule_llm_warmup()
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")
+        finally:
+            # 无论成功失败都要放行首轮 chat()，否则用户消息会一直等到超时
+            self._components_ready.set()
 
     def _init_prompt_enhancement(self):
 
@@ -729,6 +740,90 @@ class ConnectionHandler:
             ))
 
         self.logger.bind(tag=TAG).debug("已注入工具调用 few-shot 示例")
+
+    def _llm_messages(self, memory_str=None, speaker_for_system=None):
+        """真实轮次发给 LLM 的消息列表。
+
+        预热与真实轮次必须共用这一个构造入口，否则 system prompt / few-shot 会漂移，
+        预热的前缀永远不可能被命中（t_a5523178）。
+        """
+        return self.dialogue.get_llm_dialogue_with_memory(
+            memory_str, self.config.get("voiceprint", {}), speaker_for_system
+        )
+
+    def _llm_turn_tools(self, depth=0, force_final_answer=False):
+        """真实轮次传给 LLM 的 tools（depth==0 才注入 direct_answer 虚拟工具）。"""
+        if self.intent_type != "function_call" or force_final_answer:
+            return None
+        if not getattr(self, "func_handler", None):
+            return None
+        functions = list(self.func_handler.get_functions())
+        if depth == 0:
+            functions.append(DIRECT_ANSWER_TOOL)
+        return functions
+
+    def _await_first_turn_ready(self, timeout=3.0):
+        """首轮用户消息若比组件初始化先到，短暂等待初始化完成再构造请求。
+
+        否则首轮会用 quick prompt（~1,160 tokens）而预热用的是增强 prompt
+        （~2,341 tokens），前缀哈希必然不同（t_a5523178）。
+        """
+        if self._components_ready.is_set():
+            return 0.0
+        started = time.monotonic()
+        ready = self._components_ready.wait(timeout)
+        waited_ms = int((time.monotonic() - started) * 1000)
+        self.logger.bind(tag=TAG).info(
+            f"首轮等待组件初始化完成: waited_ms={waited_ms} ready={ready}"
+        )
+        return waited_ms
+
+    def _log_first_turn_prefix(self, messages_for_llm, tools):
+        """打印首轮真实请求的前缀指纹，与 warmup 日志里的 hash 逐字比对（t_a5523178）。"""
+        if self._first_turn_prefix_logged:
+            return
+        self._first_turn_prefix_logged = True
+        try:
+            from core.utils import llm_warmup
+
+            sig = llm_warmup.prefix_signature(messages_for_llm, tools)
+            self.logger.bind(tag=TAG).info(
+                f"首轮请求前缀: hash={sig['hash']} messages={sig['messages']} "
+                f"tools={sig['tools']} chars={sig['chars']}"
+            )
+            llm_warmup.dump_payload(
+                messages_for_llm, tools, "firstturn", self.config
+            )
+        except Exception as e:  # noqa: BLE001 - 只影响可观测性
+            self.logger.bind(tag=TAG).debug(f"首轮前缀指纹计算失败: {e}")
+
+    def _schedule_llm_warmup(self):
+        """预热 LLM 前缀缓存（后台线程，静默失败）。
+
+        首轮真实请求的前缀（system + tools + few-shot）若不在引擎前缀缓存里，
+        prefill 是线性的（~1ms/token）；在用户开口前用一次**流式**假请求把它写进缓存。
+        请求形状、payload 与首轮 chat() 完全一致（见 _llm_messages/_llm_turn_tools）。
+        """
+        try:
+            from core.utils import llm_warmup
+
+            tools = self._llm_turn_tools(depth=0)
+            # 与首轮 chat() 完全同型：有 memory 模块时记忆字符串是 str（可能为空串），
+            # 没有才是 None —— 这一位差异会渲染成 <memory>\n</memory> vs <memory>\n\n</memory>
+            memory_str = "" if getattr(self, "memory", None) is not None else None
+            messages = self._llm_messages(memory_str, None)
+            signature = llm_warmup.payload_signature(messages, tools)
+            self.logger.bind(tag=TAG).info(
+                f"首轮前缀快照: hash={signature['hash']} messages={signature['messages']} "
+                f"tools={signature['tools']} chars={signature['chars']}"
+            )
+            llm_warmup.dump_payload(messages, tools, "snapshot", self.config)
+            status = llm_warmup.schedule_warmup(
+                getattr(self, "llm", None), messages, tools, self.config
+            )
+            self.logger.bind(tag=TAG).info(f"LLM 前缀预热: {status}")
+        except Exception as e:
+            self.logger.bind(tag=TAG).info(f"LLM 前缀预热调度失败: {e}")
 
     def _init_report_threads(self):
         """初始化ASR和TTS上报线程"""
@@ -1061,6 +1156,9 @@ class ConnectionHandler:
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
+            # 首轮必须等组件初始化完成：否则 system prompt 还是 quick prompt，
+            # 与预热快照（增强 prompt + few-shot）不是同一前缀，缓存永远命中不了
+            self._await_first_turn_ready()
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self.dialogue.put(Message(role="user", content=query))
@@ -1128,19 +1226,19 @@ class ConnectionHandler:
 
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
+                messages_for_llm = self._llm_messages(memory_str, speaker_for_system)
+                self._log_first_turn_prefix(messages_for_llm, functions)
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    messages_for_llm,
                     functions=functions,
                 )
             else:
+                messages_for_llm = self._llm_messages(memory_str, speaker_for_system)
+                self._log_first_turn_prefix(messages_for_llm, functions)
                 llm_responses = self.llm.response(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    messages_for_llm,
                 )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
