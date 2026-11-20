@@ -7,6 +7,7 @@ from typing import Optional, Dict
 from config.logger import setup_logging
 from core.utils.cache.manager import cache_manager
 from core.utils.cache.config import CacheType
+from core.utils.dialogue import UNKNOWN_SPEAKER
 
 TAG = __name__
 logger = setup_logging()
@@ -174,7 +175,7 @@ class VoiceprintProvider:
                         # 相似度阈值检查
                         if score < self.similarity_threshold:
                             logger.bind(tag=TAG).warning(f"声纹识别相似度{score:.3f}低于阈值{self.similarity_threshold}")
-                            return "未知说话人"
+                            return UNKNOWN_SPEAKER
                         
                         if speaker_id and speaker_id in self.speaker_map:
                             result_name = self.speaker_map[speaker_id]["name"]
@@ -182,7 +183,7 @@ class VoiceprintProvider:
                             return result_name
                         else:
                             logger.bind(tag=TAG).warning(f"未识别的说话人ID: {speaker_id}")
-                            return "未知说话人"
+                            return UNKNOWN_SPEAKER
                     else:
                         logger.bind(tag=TAG).error(f"声纹识别API错误: HTTP {response.status}")
                         return None

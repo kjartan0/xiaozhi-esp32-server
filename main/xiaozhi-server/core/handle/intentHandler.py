@@ -112,11 +112,11 @@ async def process_intent_result(
                     )
 
                     # 构建带上下文的基础提示
-                    context_prompt = f"""当前时间：{current_time}
-                                        今天日期：{today_date} ({today_weekday})
-                                        今天农历：{lunar_date}
+                    # t_c30a9895: Dutch — this text goes straight into the LLM prompt.
+                    context_prompt = f"""Huidige tijd: {current_time}
+                                        Datum van vandaag: {today_date} ({today_weekday})
 
-                                        请根据以上信息回答用户的问题：{original_text}"""
+                                        Beantwoord de vraag van de gebruiker met deze gegevens, in het Nederlands: {original_text}"""
 
                     # 使用异步调用避免阻塞事件循环，影响其他设备的音频播放
                     try:
@@ -179,7 +179,7 @@ async def process_intent_result(
                 except Exception as e:
                     conn.logger.bind(tag=TAG).error(f"工具调用失败: {e}")
                     result = ActionResponse(
-                        action=Action.ERROR, result="工具调用超时，请一会再试下哈", response="工具调用超时，请一会再试下哈"
+                        action=Action.ERROR, result="De tool reageerde niet op tijd, probeer het zo nog eens", response="De tool reageerde niet op tijd, probeer het zo nog eens"
                     )
 
                 # 上报工具调用结果

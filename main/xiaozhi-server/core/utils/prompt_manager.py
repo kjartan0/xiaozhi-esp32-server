@@ -17,13 +17,13 @@ from jinja2 import Template
 TAG = __name__
 
 WEEKDAY_MAP = {
-    "Monday": "星期一",
-    "Tuesday": "星期二",
-    "Wednesday": "星期三",
-    "Thursday": "星期四",
-    "Friday": "星期五",
-    "Saturday": "星期六",
-    "Sunday": "星期日",
+    "Monday": "maandag",
+    "Tuesday": "dinsdag",
+    "Wednesday": "woensdag",
+    "Thursday": "donderdag",
+    "Friday": "vrijdag",
+    "Saturday": "zaterdag",
+    "Sunday": "zondag",
 }
 
 EMOJI_List = [
@@ -139,90 +139,96 @@ class PromptManager:
 
         today_date = get_current_date()
         today_weekday = get_current_weekday()
-        lunar_date = get_current_lunar_date() + "\n"
+        # t_c30a9895: the lunar date line was removed from agent-base-prompt.txt;
+        # the value is kept as an empty string so the render() contract is stable.
+        lunar_date = ""
 
         return today_date, today_weekday, lunar_date
 
     def _get_location_info(self, client_ip: str) -> str:
-        """获取位置信息"""
+        """Plaats voor de prompt; nooit leeg (t_9fe9586d).
+
+        Vroeger stond hier alleen de IP-city van een China-only geocoder. Voor
+        een Nederlands IP is dat een lege string, waardoor de prompt een lege
+        ``location`` kreeg en het weer helemaal overgeslagen werd. Nu is de
+        geconfigureerde thuisbasis de terugval en mag een IP-city alleen
+        overschrijven als hij bruikbaar is.
+        """
+        from core.utils.location import resolve_local_address
+
+        cache_key = client_ip or "no-client-ip"
         try:
-            # 先从缓存获取
-            cached_location = self.cache_manager.get(self.CacheType.LOCATION, client_ip)
-            if cached_location is not None:
+            cached_location = self.cache_manager.get(self.CacheType.LOCATION, cache_key)
+            # Een lege waarde uit een eerdere deploy nooit als cache-hit zien.
+            if cached_location:
                 return cached_location
 
-            # 缓存未命中，调用API获取
-            from core.utils.util import get_ip_info
-
-            ip_info = get_ip_info(client_ip, self.logger)
-            city = ip_info.get("city", "未知位置")
-            location = f"{city}"
-
-            # 存入缓存
-            self.cache_manager.set(self.CacheType.LOCATION, client_ip, location)
+            location = resolve_local_address(self.config, client_ip, self.logger)
+            self.cache_manager.set(self.CacheType.LOCATION, cache_key, location)
             return location
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"获取位置信息失败: {e}")
-            return "未知位置"
+            self.logger.bind(tag=TAG).error(f"locatie bepalen mislukt: {e}")
+            return resolve_local_address(self.config, None, self.logger)
 
     def _get_weather_info(self, conn: "ConnectionHandler", location: str) -> str:
-        """获取天气信息"""
+        """Weerbericht voor de promptcontext, Nederlands, via Open-Meteo."""
+        from core.utils import weather as weather_utils
+
+        cache_key = weather_utils.cache_key(location, "nl")
         try:
-            # 先从缓存获取
-            cached_weather = self.cache_manager.get(self.CacheType.WEATHER, location)
-            if cached_weather is not None:
+            cached_weather = self.cache_manager.get(self.CacheType.WEATHER, cache_key)
+            if cached_weather:
                 return cached_weather
 
-            # 缓存未命中，调用 async get_weather 函数
-            # Windows ProactorEventLoop 不支持 run_coroutine_threadsafe().result()
-            # 因此用 call_soon_threadsafe 提交任务 + threading.Event 等待结果
-            # 注意：Event.wait() 只阻塞当前线程池线程，不阻塞主事件循环
-            from plugins_func.functions.get_weather import get_weather
-            from plugins_func.register import ActionResponse
-
+            # Lokaal async rapport bouwen. Windows ProactorEventLoop ondersteunt
+            # run_coroutine_threadsafe().result() niet; daarom call_soon_threadsafe
+            # + threading.Event (blokkeert alleen deze thread, niet de event loop).
             result_holder = []
             exception_holder = []
+            event = threading.Event()
 
             async def _call():
                 try:
                     result_holder.append(
-                        await get_weather(conn, location=location, lang="zh_CN")
+                        await weather_utils.build_report_for(
+                            self.config, location, lang="nl", include_city=False
+                        )
                     )
                 except Exception as e:
                     exception_holder.append(e)
                 finally:
                     event.set()
 
-            event = threading.Event()
             conn.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_call()))
-            if not event.wait(timeout=10):
-                raise TimeoutError("获取天气信息超时")
+            if not event.wait(timeout=5):
+                raise TimeoutError("weerbericht ophalen duurde te lang")
             if exception_holder:
                 raise exception_holder[0]
-            result = result_holder[0]
-            if isinstance(result, ActionResponse):
-                weather_report = result.result
-                self.cache_manager.set(self.CacheType.WEATHER, location, weather_report)
-                return weather_report
-            return "天气信息获取失败"
+            weather_report = result_holder[0] if result_holder else None
+            if not weather_report:
+                raise RuntimeError(f"geen weerbericht voor {location!r}")
+
+            self.cache_manager.set(self.CacheType.WEATHER, cache_key, weather_report)
+            return weather_report
 
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"获取天气信息失败: {e}")
-            return "天气信息获取失败"
+            self.logger.bind(tag=TAG).error(f"weerbericht ophalen mislukt: {e}")
+            return ""
 
     def update_context_info(self, conn, client_ip: str):
         """同步更新上下文信息"""
         try:
             local_address = ""
-            if (
-                client_ip
-                and self.base_prompt_template
+            wants_context = bool(
+                self.base_prompt_template
                 and (
                     "local_address" in self.base_prompt_template
                     or "weather_info" in self.base_prompt_template
                 )
-            ):
-                # 获取位置信息（使用全局缓存）
+            )
+            if wants_context:
+                # Zonder client_ip geldt de thuisbasis: de locatie is nooit leeg,
+                # dus het weer wordt niet meer overgeslagen (t_9fe9586d).
                 local_address = self._get_location_info(client_ip)
 
             if (
@@ -274,26 +280,39 @@ class PromptManager:
             # 获取缓存的上下文信息
             local_address = ""
             weather_info = ""
+            from core.utils import weather as weather_utils
 
-            if client_ip:
-                # 获取位置信息（从全局缓存）
-                local_address = (
-                    self.cache_manager.get(self.CacheType.LOCATION, client_ip) or ""
-                )
+            location_cache_key = client_ip or "no-client-ip"
+            # 获取位置信息（从全局缓存）
+            local_address = (
+                self.cache_manager.get(self.CacheType.LOCATION, location_cache_key) or ""
+            )
+            if not local_address:
+                # Cache leeg of een oude lege waarde: altijd een echte plaats.
+                local_address = self._get_location_info(client_ip)
 
-                # 获取天气信息（从全局缓存）
-                if local_address:
-                    weather_info = (
-                        self.cache_manager.get(self.CacheType.WEATHER, local_address)
-                        or ""
+            # 获取天气信息（从全局缓存）
+            if local_address:
+                weather_info = (
+                    self.cache_manager.get(
+                        self.CacheType.WEATHER,
+                        weather_utils.cache_key(local_address, "nl"),
                     )
+                    or ""
+                )
+            if not weather_info:
+                # Nooit een leeg "local upcoming weather" in de prompt laten staan.
+                weather_info = "niet beschikbaar"
 
             # 获取TTS选择的语言，默认值为中文
+            # t_c30a9895: the fallback is Dutch, not 中文 — an unset TTS language
+            # used to inject the string "中文" into the prompt's "Answer in
+            # {{language}}" rule.
             language = (
                 self.config.get("TTS", {})
                 .get(self.config.get("selected_module", {}).get("TTS", ""), {})
                 .get("language")
-                or "中文"
+                or "Nederlands"
             )
             self.logger.bind(tag=TAG).debug(f"获取到选择的语言: {language}")
 

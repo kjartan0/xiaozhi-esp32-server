@@ -3,6 +3,13 @@ import re
 from typing import List, Dict
 from datetime import datetime
 
+# Sentinel returned by the voiceprint provider when a voice is not recognized.
+# t_c30a9895: Dutch, because it is rendered into the LLM prompt (agent-base-prompt
+# <speaker> block) and into <speakers_info>; a Chinese sentinel pulled the spoken
+# answer towards Chinese. Single source of truth: keep provider, comparisons and
+# the prompt template on this one string.
+UNKNOWN_SPEAKER = "onbekende spreker"
+
 
 class Message:
     def __init__(
@@ -92,7 +99,7 @@ class Dialogue:
         for missing_id in pending_tool_calls:
             dummy_tool_msg = Message(
                 role="tool",
-                content='{"status": "interrupted", "message": "动作已取消/被打断"}',
+                content='{"status": "interrupted", "message": "actie geannuleerd/onderbroken"}',
                 tool_call_id=missing_id
             )
             result.append(dummy_tool_msg)
@@ -136,10 +143,10 @@ class Dialogue:
                 current_speaker_name = (current_speaker or "").strip()
                 # 仅在本轮注入了有效身份时才输出 speakers_info，避免列表里的名字每轮
                 # 重复出现诱导模型反复称呼；后续轮不再注入身份，靠对话历史首轮保留
-                if current_speaker_name and current_speaker_name != "未知说话人":
+                if current_speaker_name and current_speaker_name != UNKNOWN_SPEAKER:
                     speakers = voiceprint_config.get("speakers", [])
                     speakers_info = "\n<speakers_info>"
-                    speakers_info += f"\n当前说话人：{current_speaker_name}"
+                    speakers_info += f"\nHuidige spreker: {current_speaker_name}"
                     for speaker_str in speakers:
                         try:
                             parts = speaker_str.split(",", 2)
@@ -148,7 +155,7 @@ class Dialogue:
                                 description = (
                                     parts[2].strip() if len(parts) >= 3 else ""
                                 )
-                                speakers_info += f"\n- {name}：{description}"
+                                speakers_info += f"\n- {name}: {description}"
                         except:
                             pass
                     speakers_info += "\n</speakers_info>"

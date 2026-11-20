@@ -1,6 +1,7 @@
 """设备端MCP客户端支持模块"""
 
 import json
+import os
 import asyncio
 import re
 from core.utils.util import get_vision_url
@@ -14,6 +15,80 @@ if TYPE_CHECKING:
 
 TAG = __name__
 logger = setup_logging()
+
+# t_c30a9895: Dutch tool descriptions for the device MCP tools.
+# The ESP32 firmware ships its own (Chinese) descriptions over MCP. We deliberately
+# do not touch or reflash the firmware: the text going into the LLM prompt is
+# overridden server-side from data/tool_desc_nl.json, and tool NAMES are left
+# untouched because the device protocol dispatches on them.
+_DUTCH_TOOL_DESCRIPTIONS = None
+
+
+def _load_dutch_tool_descriptions() -> dict:
+    """Load data/tool_desc_nl.json once (data/ is bind-mounted: restart picks up edits)."""
+    global _DUTCH_TOOL_DESCRIPTIONS
+    if _DUTCH_TOOL_DESCRIPTIONS is not None:
+        return _DUTCH_TOOL_DESCRIPTIONS
+
+    _DUTCH_TOOL_DESCRIPTIONS = {}
+    try:
+        from config.config_loader import get_project_dir
+
+        path = os.path.join(get_project_dir(), "data", "tool_desc_nl.json")
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        if not isinstance(data, dict):
+            raise ValueError("root must be an object")
+        # Drop the "_comment" documentation key if present
+        _DUTCH_TOOL_DESCRIPTIONS = {
+            k: v for k, v in data.items() if isinstance(v, dict)
+        }
+        logger.bind(tag=TAG).info(
+            f"Nederlandse tool-beschrijvingen geladen: {len(_DUTCH_TOOL_DESCRIPTIONS)}"
+        )
+    except FileNotFoundError:
+        logger.bind(tag=TAG).warning(
+            "data/tool_desc_nl.json niet gevonden; firmware-beschrijvingen blijven staan"
+        )
+    except Exception as e:
+        logger.bind(tag=TAG).error(
+            f"data/tool_desc_nl.json kon niet worden geladen: {e}"
+        )
+    return _DUTCH_TOOL_DESCRIPTIONS
+
+
+def apply_dutch_tool_descriptions(mcp_client: "MCPClient") -> int:
+    """Overwrite tool/param descriptions with Dutch; fall back to the original text."""
+    overrides = _load_dutch_tool_descriptions()
+    if not overrides:
+        return 0
+
+    applied = 0
+    for tool_name, tool_data in mcp_client.tools.items():
+        entry = overrides.get(tool_name)
+        if not isinstance(entry, dict):
+            continue
+
+        description = entry.get("description")
+        if isinstance(description, str) and description.strip():
+            tool_data["description"] = description
+
+        params = entry.get("params") or {}
+        if isinstance(params, dict):
+            properties = (tool_data.get("inputSchema") or {}).get("properties") or {}
+            for param_name, param_description in params.items():
+                prop = properties.get(param_name)
+                if isinstance(prop, dict) and param_description:
+                    prop["description"] = param_description
+        applied += 1
+
+    # The available-tools list is cached on the client; invalidate it so the next
+    # get_available_tools() renders the Dutch text.
+    mcp_client._cached_available_tools = None
+    logger.bind(tag=TAG).info(
+        f"Nederlandse tool-beschrijvingen toegepast op {applied}/{len(mcp_client.tools)} tools"
+    )
+    return applied
 
 # ---- t_a2a3bf8a: 设备 MCP 工具列表分页（nextCursor）的发布与兜底 ----
 
@@ -31,6 +106,9 @@ def _localize_tool_descriptions(mcp_client: MCPClient) -> None:
             for sanitized_name, original_name in mcp_client.name_mapping.items():
                 description = description.replace(original_name, sanitized_name)
             tool_data["description"] = description
+
+    # t_c30a9895: 荷兰语描述要在名字替换之后套，覆盖文本才会生效。
+    apply_dutch_tool_descriptions(mcp_client)
 
 
 async def _finalise_tool_list(

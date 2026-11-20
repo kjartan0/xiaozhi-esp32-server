@@ -20,13 +20,13 @@ play_music_function_desc = {
     "type": "function",
     "function": {
         "name": "play_music",
-        "description": "当用户要求播放音乐、歌曲时调用。",
+        "description": "Roep dit aan als de gebruiker muziek of een liedje wil horen.",
         "parameters": {
             "type": "object",
             "properties": {
                 "song_name": {
                     "type": "string",
-                    "description": "歌曲名称；用户未指定具体歌名时为'random'",
+                    "description": "Titel van het liedje; 'random' als de gebruiker geen titel noemt",
                 }
             },
             "required": ["song_name"],
@@ -39,22 +39,22 @@ play_music_function_desc = {
 async def play_music(conn: "ConnectionHandler", song_name: str):
     try:
         music_intent = (
-            f"播放音乐 {song_name}" if song_name != "random" else "随机播放音乐"
+            f"speel {song_name}" if song_name != "random" else "speel willekeurig"
         )
         await handle_music_command(conn, music_intent)
         return ActionResponse(
-            action=Action.RECORD, result="指令已接收", response="正在为您播放音乐"
+            action=Action.RECORD, result="Opdracht ontvangen", response="Ik zet de muziek voor je op"
         )
     except Exception as e:
         conn.logger.bind(tag=TAG).error(f"处理音乐意图错误: {e}")
         return ActionResponse(
-            action=Action.RESPONSE, result=str(e), response="播放音乐时出错了"
+            action=Action.RESPONSE, result=str(e), response="Er ging iets mis bij het afspelen van muziek"
         )
 
 
 def _extract_song_name(text):
     """从用户输入中提取歌名"""
-    for keyword in ["播放音乐"]:
+    for keyword in ["speel", "draai", "zet op"]:
         if keyword in text:
             parts = text.split(keyword)
             if len(parts) > 1:
@@ -156,13 +156,13 @@ def _get_random_play_prompt(song_name):
     # 移除文件扩展名
     clean_name = os.path.splitext(song_name)[0]
     prompts = [
-        f"正在为您播放，《{clean_name}》",
-        f"请欣赏歌曲，《{clean_name}》",
-        f"即将为您播放，《{clean_name}》",
-        f"现在为您带来，《{clean_name}》",
-        f"让我们一起聆听，《{clean_name}》",
-        f"接下来请欣赏，《{clean_name}》",
-        f"此刻为您献上，《{clean_name}》",
+        f"Ik zet voor je op: {clean_name}",
+        f"Luister maar: {clean_name}",
+        f"Hier komt {clean_name}",
+        f"Dit is {clean_name}",
+        f"Even samen luisteren naar {clean_name}",
+        f"En nu: {clean_name}",
+        f"Voor jou: {clean_name}",
     ]
     # 直接使用random.choice，不设置seed
     return random.choice(prompts)

@@ -30,7 +30,7 @@ from core.utils.modules_initialize import (
 from core.handle.reportHandle import report, enqueue_tool_report
 from core.providers.tts.default import DefaultTTS
 from concurrent.futures import ThreadPoolExecutor
-from core.utils.dialogue import Message, Dialogue
+from core.utils.dialogue import Message, Dialogue, UNKNOWN_SPEAKER
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
@@ -57,17 +57,19 @@ class TTSException(RuntimeError):
 
 # direct_answer 虚拟工具定义
 # 不是真实工具，是路由机制：将"调不调工具"的二选一变为"调哪个"的多选，防止小模型误触发真实工具
+# NOTE (t_c30a9895): this description is part of the LLM prompt prefix, so it is
+# Dutch — the model under this profile only ever answers in Dutch.
 DIRECT_ANSWER_TOOL = {
     "type": "function",
     "function": {
         "name": "direct_answer",
-        "description": "当用户的请求不匹配其他任何工具时，可用此选项直接回复。将回复内容写在response参数里。",
+        "description": "Gebruik deze optie om direct te antwoorden wanneer het verzoek van de gebruiker bij geen enkel ander hulpmiddel past. Zet je antwoord in de parameter response.",
         "parameters": {
             "type": "object",
             "properties": {
                 "response": {
                     "type": "string",
-                    "description": "你回复用户的完整内容",
+                    "description": "Je volledige antwoord aan de gebruiker",
                 },
             },
             "required": ["response"],
@@ -700,43 +702,46 @@ class ConnectionHandler:
 
         # === few-shot 示例（is_temporary）===
         # 展示 direct_answer 携带 response 参数的用法，一次调用完成回复
+        # NOTE (t_c30a9895): these examples are Dutch on purpose. They are sent on
+        # every request and previously anchored the model's reply language to
+        # Chinese, which leaked into the spoken Dutch answer.
 
         # 示例1：direct_answer（回复内容写在 response 参数里，无需递归）
         da_tc_id = "fewshot_da_001"
-        self.dialogue.put(Message(role="user", content="给我讲个故事吧", is_temporary=True))
+        self.dialogue.put(Message(role="user", content="Vertel eens een verhaal", is_temporary=True))
         self.dialogue.put(Message(
             role="assistant",
             tool_calls=[{
                 "id": da_tc_id,
-                "function": {"arguments": '{"response": "好呀，你想听什么类型的呀？童话、冒险还是搞笑的？选一个我给你开讲~"}', "name": "direct_answer"},
+                "function": {"arguments": '{"response": "Leuk, wat voor verhaal wil je horen? Een sprookje, een avontuur of iets grappigs? Kies maar, dan begin ik meteen~"}', "name": "direct_answer"},
                 "type": "function", "index": 0,
             }],
             is_temporary=True,
         ))
         self.dialogue.put(Message(
             role="tool", tool_call_id=da_tc_id,
-            content="已直接回复", is_temporary=True,
+            content="Al direct beantwoord", is_temporary=True,
         ))
 
         # 示例2：真实工具调用（handle_exit_intent）
         if "handle_exit_intent" in tool_names:
             tc_id = "fewshot_exit_001"
-            self.dialogue.put(Message(role="user", content="拜拜", is_temporary=True))
+            self.dialogue.put(Message(role="user", content="Doei", is_temporary=True))
             self.dialogue.put(Message(
                 role="assistant",
                 tool_calls=[{
                     "id": tc_id,
-                    "function": {"arguments": '{"say_goodbye": "再见，下次再聊~"}', "name": "handle_exit_intent"},
+                    "function": {"arguments": '{"say_goodbye": "Tot ziens, tot de volgende keer~"}', "name": "handle_exit_intent"},
                     "type": "function", "index": 0,
                 }],
                 is_temporary=True,
             ))
             self.dialogue.put(Message(
                 role="tool", tool_call_id=tc_id,
-                content="退出意图已处理", is_temporary=True,
+                content="Afscheid afgehandeld", is_temporary=True,
             ))
             self.dialogue.put(Message(
-                role="assistant", content="再见，下次再聊~", is_temporary=True,
+                role="assistant", content="Tot ziens, tot de volgende keer~", is_temporary=True,
             ))
 
         self.logger.bind(tag=TAG).debug("已注入工具调用 few-shot 示例")
@@ -1214,7 +1219,7 @@ class ConnectionHandler:
             self.dialogue.put(
                 Message(
                     role="user",
-                    content="[系统提示] 已达到最大工具调用次数限制，请你基于目前已经获取的所有信息，直接给出最终答案。不要再尝试调用任何工具。",
+                    content="[Systeemmelding] Het maximum aantal tool-aanroepen is bereikt. Geef nu direct een definitief antwoord op basis van alle informatie die je al hebt. Probeer geen tools meer aan te roepen.",
                 )
             )
 
@@ -1248,7 +1253,7 @@ class ConnectionHandler:
             # 避免每轮在 system 重复出现名字诱导模型反复称呼
             speaker_for_system = None
             cs = (self.current_speaker or "").strip()
-            if cs and cs != "未知说话人" and cs not in self.system_introduced_speakers:
+            if cs and cs != UNKNOWN_SPEAKER and cs not in self.system_introduced_speakers:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
@@ -1487,7 +1492,7 @@ class ConnectionHandler:
                         )
                         # 超时时返回错误响应，避免整个流程卡死
                         tool_results.append((
-                            ActionResponse(action=Action.ERROR, result="哎呀，网络遇到点问题，请稍后再试下！"),
+                            ActionResponse(action=Action.ERROR, result="Oeps, er ging iets mis met de verbinding, probeer het zo nog eens!"),
                             tool_call_data
                         ))
                         # 上报工具调用错误

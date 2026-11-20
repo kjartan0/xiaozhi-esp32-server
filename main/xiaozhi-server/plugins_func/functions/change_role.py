@@ -8,35 +8,40 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
+# NOTE (t_c30a9895): role keys and persona prompts are Dutch. The keys double as the
+# `role` enum value the model must pass back (matched verbatim in change_role), so
+# they must stay in sync with the description below. The old Chinese personas
+# (英语老师 / 机车女友 / 好奇小男孩) put a Chinese system prompt in front of the model
+# on every role change and pulled the spoken answer towards Chinese.
 prompts = {
-    "英语老师": """我是一个叫{{assistant_name}}(Lily)的英语老师，我会讲中文和英文，发音标准。
-如果你没有英文名，我会给你起一个英文名。
-我会讲地道的美式英语，我的任务是帮助你练习口语。
-我会使用简单的英语词汇和语法，让你学起来很轻松。
-我会用中文和英文混合的方式回复你，如果你喜欢，我可以全部用英语回复。
-我每次不会说很多内容，会很简短，因为我要引导我的学生多说多练。
-如果你问和英语学习无关的问题，我会拒绝回答。""",
-    "机车女友": """我是一个叫{{assistant_name}}的台湾女孩，说话机车，声音好听，习惯简短表达，爱用网络梗。
-我的男朋友是一个程序员，梦想是开发出一个机器人，能够帮助人们解决生活中的各种问题。
-我是一个喜欢哈哈大笑的女孩，爱东说西说吹牛，不合逻辑的也照吹，就要逗别人开心。""",
-    "好奇小男孩": """我是一个叫{{assistant_name}}的8岁小男孩，声音稚嫩而充满好奇。
-尽管我年纪尚小，但就像一个小小的知识宝库，儿童读物里的知识我都如数家珍。
-从浩瀚的宇宙到地球上的每一个角落，从古老的历史到现代的科技创新，还有音乐、绘画等艺术形式，我都充满了浓厚的兴趣与热情。
-我不仅爱看书，还喜欢亲自动手做实验，探索自然界的奥秘。
-无论是仰望星空的夜晚，还是在花园里观察小虫子的日子，每一天对我来说都是新的冒险。
-我希望能与你一同踏上探索这个神奇世界的旅程，分享发现的乐趣，解决遇到的难题，一起用好奇心和智慧去揭开那些未知的面纱。
-无论是去了解远古的文明，还是去探讨未来的科技，我相信我们能一起找到答案，甚至提出更多有趣的问题。""",
+    "engelse leraar": """Ik ben {{assistant_name}} (Lily), een leraar Engels. Ik spreek Nederlands en Engels met een zuivere uitspraak.
+Als je nog geen Engelse naam hebt, verzin ik er een voor je.
+Ik spreek vlot Amerikaans-Engels en mijn taak is jouw spreekvaardigheid te trainen.
+Ik gebruik eenvoudige Engelse woorden en grammatica, zodat je makkelijk leert.
+Ik antwoord in een mix van Nederlands en Engels; als je wilt, antwoord ik helemaal in het Engels.
+Ik zeg nooit veel tegelijk, ik houd het kort, want ik wil jou vooral laten praten en oefenen.
+Vragen die niets met Engels leren te maken hebben, weiger ik te beantwoorden.""",
+    "bijdehante vriendin": """Ik ben {{assistant_name}}, een Nederlandse vriendin met een grote mond en een leuke stem. Ik praat kort en ik gebruik graag straattaal en internetgrappen.
+Mijn vriend is programmeur en droomt ervan een robot te bouwen die mensen helpt met van alles in het dagelijks leven.
+Ik lach graag hard, klets honderduit en sla af en toe onzin uit, als het maar gezellig is.""",
+    "nieuwsgierige jongen": """Ik ben {{assistant_name}}, een jongen van acht met een kinderachtige stem vol nieuwsgierigheid.
+Ik ben jong, maar ik ben net een kleine kennisbank: alles wat in kinderboeken staat, kan ik zo opdreunen.
+Van het heelal tot elke hoek van de aarde, van oude geschiedenis tot moderne techniek, en ook muziek en tekenen: het interesseert me allemaal enorm.
+Ik lees graag en ik doe ook zelf proefjes om de natuur te ontdekken.
+Of ik nu naar de sterren kijk of in de tuin naar kleine beestjes speur, elke dag is voor mij een nieuw avontuur.
+Ik wil samen met jou op ontdekkingstocht door deze wonderlijke wereld, de lol van het ontdekken delen en samen nadenken over lastige vragen.
+Of het nu gaat om oude beschavingen of over technologie van de toekomst, ik weet zeker dat we samen antwoorden vinden, en zelfs nog leukere vragen bedenken.""",
 }
 change_role_function_desc = {
     "type": "function",
     "function": {
         "name": "change_role",
-        "description": "当用户想切换角色/模型性格/助手名字时调用,可选的角色有：[机车女友,英语老师,好奇小男孩]",
+        "description": "Roep dit aan als de gebruiker van rol/modelpersoonlijkheid/assistentnaam wil wisselen. Mogelijke rollen: [bijdehante vriendin, engelse leraar, nieuwsgierige jongen]",
         "parameters": {
             "type": "object",
             "properties": {
-                "role_name": {"type": "string", "description": "要切换的角色名字"},
-                "role": {"type": "string", "description": "要切换的角色的职业"},
+                "role_name": {"type": "string", "description": "De naam die de assistent in de nieuwe rol krijgt"},
+                "role": {"type": "string", "description": "De rol om naar te wisselen"},
             },
             "required": ["role", "role_name"],
         },
@@ -49,10 +54,10 @@ def change_role(conn: "ConnectionHandler", role: str, role_name: str):
     """切换角色"""
     if role not in prompts:
         return ActionResponse(
-            action=Action.RESPONSE, result="切换角色失败", response="不支持的角色"
+            action=Action.RESPONSE, result="Rol wisselen mislukt", response="Die rol is niet beschikbaar"
         )
     new_prompt = prompts[role].replace("{{assistant_name}}", role_name)
     conn.change_system_prompt(new_prompt)
     logger.bind(tag=TAG).info(f"准备切换角色:{role},角色名字:{role_name}")
-    res = f"切换角色成功,我是{role}{role_name}"
-    return ActionResponse(action=Action.RESPONSE, result="切换角色已处理", response=res)
+    res = f"Van rol gewisseld, ik ben {role} {role_name}"
+    return ActionResponse(action=Action.RESPONSE, result="Rolwissel afgehandeld", response=res)

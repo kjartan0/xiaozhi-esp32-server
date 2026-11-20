@@ -13,27 +13,32 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
+# NOTE (t_c30a9895): this plugin scrapes chinanews.com.cn RSS — Chinese news, in
+# Chinese, for a Chinese audience. Its tool description is Dutch so it no longer
+# pulls the prompt into Chinese, but for a Dutch user it is arguably irrelevant;
+# it is kept (not removed) because removing a tool is the owner's call, not a
+# translation detail. See the card handoff.
 GET_NEWS_FROM_CHINANEWS_FUNCTION_DESC = {
     "type": "function",
     "function": {
         "name": "get_news_from_chinanews",
         "description": (
-            "当用户要求查看或收听新闻时调用，可指定类别（社会/科技/国际），默认社会新闻。"
+            "Roep dit aan als de gebruiker nieuws wil zien of horen; je kunt een rubriek meegeven (algemeen, binnenland, buitenland, economie); zonder rubriek krijg je het algemene nieuws."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "category": {
                     "type": "string",
-                    "description": "新闻类别，例如社会、科技、国际。可选参数，如果不提供则使用默认类别",
+                    "description": "Rubriek, bijvoorbeeld algemeen, binnenland, buitenland of economie. Optioneel; zonder waarde wordt de standaardrubriek gebruikt",
                 },
                 "detail": {
                     "type": "boolean",
-                    "description": "是否获取详细内容，默认为false。如果为true，则获取上一条新闻的详细内容",
+                    "description": "Of de volledige inhoud moet worden opgehaald; standaard false. Bij true krijg je de details van het laatst genoemde nieuwsbericht",
                 },
                 "lang": {
                     "type": "string",
-                    "description": "语言code，如 zh_CN/en_US，默认zh_CN",
+                    "description": "Taalcode voor het antwoord, bijvoorbeeld nl of en; standaard nl",
                 },
             },
             "required": ["lang"],
@@ -55,18 +60,18 @@ async def fetch_news_from_rss(rss_url):
         news_items = []
         for item in root.findall(".//item"):
             title = (
-                item.find("title").text if item.find("title") is not None else "无标题"
+                item.find("title").text if item.find("title") is not None else "zonder titel"
             )
             link = item.find("link").text if item.find("link") is not None else "#"
             description = (
                 item.find("description").text
                 if item.find("description") is not None
-                else "无描述"
+                else "zonder beschrijving"
             )
             pubDate = (
                 item.find("pubDate").text
                 if item.find("pubDate") is not None
-                else "未知时间"
+                else "onbekende tijd"
             )
 
             news_items.append(
@@ -111,7 +116,7 @@ async def fetch_news_detail(url):
             return content[:2000]  # 限制长度
     except Exception as e:
         logger.bind(tag=TAG).error(f"获取新闻详情失败: {e}")
-        return "无法获取详细内容"
+        return "Geen volledige inhoud beschikbaar"
 
 
 def map_category(category_text):
@@ -121,17 +126,20 @@ def map_category(category_text):
 
     # 类别映射字典，目前支持社会、国际、财经新闻，如需更多类型，参见配置文件
     category_map = {
-        # 社会新闻
-        "社会": "society_rss_url",
-        "社会新闻": "society_rss_url",
-        # 国际新闻
-        "国际": "world_rss_url",
-        "国际新闻": "world_rss_url",
-        # 财经新闻
-        "财经": "finance_rss_url",
-        "财经新闻": "finance_rss_url",
-        "金融": "finance_rss_url",
-        "经济": "finance_rss_url",
+        # algemeen nieuws
+        "algemeen": "default_rss_url",
+        "algemeen nieuws": "default_rss_url",
+        # binnenlands nieuws
+        "binnenland": "society_rss_url",
+        "nationaal": "society_rss_url",
+        # buitenlands nieuws
+        "buitenland": "world_rss_url",
+        "internationaal": "world_rss_url",
+        # economisch nieuws
+        "economie": "finance_rss_url",
+        "financieel": "finance_rss_url",
+        "financien": "finance_rss_url",
+        "zakelijk": "finance_rss_url",
     }
 
     # 转换为小写并去除空格
@@ -150,7 +158,7 @@ async def get_news_from_chinanews(
     conn: "ConnectionHandler",
     category: str = None,
     detail: bool = False,
-    lang: str = "zh_CN",
+    lang: str = "nl",
 ):
     """获取新闻并随机选择一条进行播报，或获取上一条新闻的详细内容"""
     try:
@@ -163,37 +171,37 @@ async def get_news_from_chinanews(
             ):
                 return ActionResponse(
                     Action.REQLLM,
-                    "抱歉，没有找到最近查询的新闻，请先获取一条新闻。",
+                    "Sorry, ik heb nog geen recent nieuwsbericht waar ik details van kan geven; vraag eerst een nieuwsbericht op.",
                     None,
                 )
 
             link = conn.last_news_link.get("link")
-            title = conn.last_news_link.get("title", "未知标题")
+            title = conn.last_news_link.get("title", "zonder titel")
 
             if link == "#":
                 return ActionResponse(
-                    Action.REQLLM, "抱歉，该新闻没有可用的链接获取详细内容。", None
+                    Action.REQLLM, "Sorry, bij dit nieuwsbericht zit geen link naar de volledige inhoud.", None
                 )
 
-            logger.bind(tag=TAG).debug(f"获取新闻详情: {title}, URL={link}")
+            logger.bind(tag=TAG).debug(f"nieuwsdetails ophalen: {title}, URL={link}")
 
             # 获取新闻详情
             detail_content = await fetch_news_detail(link)
 
-            if not detail_content or detail_content == "无法获取详细内容":
+            if not detail_content or detail_content == "Geen volledige inhoud beschikbaar":
                 return ActionResponse(
                     Action.REQLLM,
-                    f"抱歉，无法获取《{title}》的详细内容，可能是链接已失效或网站结构发生变化。",
+                    f"Sorry, ik kan de details van {title} niet ophalen; de link werkt mogelijk niet meer.",
                     None,
                 )
 
             # 构建详情报告
             detail_report = (
-                f"根据下列数据，用{lang}回应用户的新闻详情查询请求：\n\n"
-                f"新闻标题: {title}\n"
-                f"详细内容: {detail_content}\n\n"
-                f"(请对上述新闻内容进行总结，提取关键信息，以自然、流畅的方式向用户播报，"
-                f"不要提及这是总结，就像是在讲述一个完整的新闻故事)"
+                f"Beantwoord de vraag van de gebruiker over dit nieuwsbericht met de volgende gegevens:\n\n"
+                f"Titel: {title}\n"
+                f"Inhoud: {detail_content}\n\n"
+                f"(Vat de inhoud hierboven samen in het Nederlands, haal de kern eruit en vertel het "
+                f"als een natuurlijk, vlot verhaal; zeg niet dat het een samenvatting is)"
             )
 
             return ActionResponse(Action.REQLLM, detail_report, None)
@@ -202,7 +210,7 @@ async def get_news_from_chinanews(
         # 从配置中获取RSS URL
         rss_config = conn.config.get("plugins", {}).get("get_news_from_chinanews", {})
         default_rss_url = rss_config.get(
-            "default_rss_url", "https://www.chinanews.com.cn/rss/society.xml"
+            "default_rss_url", "https://feeds.nos.nl/nosnieuwsalgemeen"
         )
 
         # 将用户输入的类别映射到配置中的类别键
@@ -214,7 +222,7 @@ async def get_news_from_chinanews(
             rss_url = rss_config[mapped_category]
 
         logger.bind(tag=TAG).info(
-            f"获取新闻: 原始类别={category}, 映射类别={mapped_category}, URL={rss_url}"
+            f"nieuws ophalen: rubriek={category}, gemapt={mapped_category}, URL={rss_url}"
         )
 
         # 获取新闻列表
@@ -222,7 +230,7 @@ async def get_news_from_chinanews(
 
         if not news_items:
             return ActionResponse(
-                Action.REQLLM, "抱歉，未能获取到新闻信息，请稍后再试。", None
+                Action.REQLLM, "Sorry, ik kon geen nieuws ophalen; probeer het later opnieuw.", None
             )
 
         # 随机选择一条新闻
@@ -233,18 +241,18 @@ async def get_news_from_chinanews(
             conn.last_news_link = {}
         conn.last_news_link = {
             "link": selected_news.get("link", "#"),
-            "title": selected_news.get("title", "未知标题"),
+            "title": selected_news.get("title", "zonder titel"),
         }
 
         # 构建新闻报告
         news_report = (
-            f"根据下列数据，用{lang}回应用户的新闻查询请求：\n\n"
-            f"新闻标题: {selected_news['title']}\n"
-            f"发布时间: {selected_news['pubDate']}\n"
-            f"新闻内容: {selected_news['description']}\n"
-            f"(请以自然、流畅的方式向用户播报这条新闻，可以适当总结内容，"
-            f"直接读出新闻即可，不需要额外多余的内容。"
-            f"如果用户询问更多详情，告知用户可以说'请详细介绍这条新闻'获取更多内容)"
+            f"Beantwoord de nieuwsvraag van de gebruiker met de volgende gegevens:\n\n"
+            f"Titel: {selected_news['title']}\n"
+            f"Gepubliceerd: {selected_news['pubDate']}\n"
+            f"Inhoud: {selected_news['description']}\n"
+            f"(Vertel dit bericht in het Nederlands in natuurlijke, vlotte spreektaal; vat het waar "
+            f"nodig kort samen. Lees het bericht gewoon voor, zonder extra inleiding. "
+            f"Wil de gebruiker meer details, zeg dan dat die om de details van dit bericht kan vragen.)"
         )
 
         return ActionResponse(Action.REQLLM, news_report, None)
@@ -252,5 +260,5 @@ async def get_news_from_chinanews(
     except Exception as e:
         logger.bind(tag=TAG).error(f"获取新闻出错: {e}")
         return ActionResponse(
-            Action.REQLLM, "抱歉，获取新闻时发生错误，请稍后再试。", None
+            Action.REQLLM, "Sorry, er ging iets mis bij het ophalen van het nieuws; probeer het later opnieuw.", None
         )

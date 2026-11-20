@@ -7,13 +7,13 @@ import cnlunar
 from datetime import datetime
 
 WEEKDAY_MAP = {
-    "Monday": "星期一",
-    "Tuesday": "星期二", 
-    "Wednesday": "星期三",
-    "Thursday": "星期四",
-    "Friday": "星期五",
-    "Saturday": "星期六",
-    "Sunday": "星期日",
+    "Monday": "maandag",
+    "Tuesday": "dinsdag",
+    "Wednesday": "woensdag",
+    "Thursday": "donderdag",
+    "Friday": "vrijdag",
+    "Saturday": "zaterdag",
+    "Sunday": "zondag",
 }
 
 
@@ -40,19 +40,16 @@ def get_current_weekday() -> str:
 
 
 def get_current_lunar_date() -> str:
+    """获取农历日期字符串
+
+    NOTE (t_c30a9895): returns "" deliberately. cnlunar only emits Chinese
+    calendar names (二零二六年十月初八), and this line was injected into the LLM
+    system prompt — Chinese text in the prompt pulled the spoken answer towards
+    Chinese. The lunar line was dropped from agent-base-prompt.txt instead of
+    being translated, because a Chinese-lunar date is not something the Dutch
+    prompt context needs.
     """
-    获取农历日期字符串
-    """
-    try:
-        now = datetime.now()
-        today_lunar = cnlunar.Lunar(now, godType="8char")
-        return "%s年%s%s" % (
-            today_lunar.lunarYearCn,
-            today_lunar.lunarMonthCn[:-1],
-            today_lunar.lunarDayCn,
-        )
-    except Exception:
-        return "农历获取失败"
+    return ""
 
 
 def get_current_time_info() -> tuple:

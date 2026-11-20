@@ -61,192 +61,126 @@ class FakeConn:
 
 
 # ---------------------------------------------------------------------------
-# 城市查询
+# Weer (Open-Meteo, keyless — t_9fe9586d)
+#
+# De QWeather-tests zijn vervallen met de provider: die functies bestaan niet
+# meer en de gedeelde demo-sleutel gaf HTTP 401.
 # ---------------------------------------------------------------------------
 
+HOME_WEATHER_CONFIG = {
+    "provider": "open_meteo",
+    "home_location": "Zoetermeer, Nederland",
+    "home_lat": 52.0575,
+    "home_lon": 4.4931,
+    "forecast_days": 7,
+    "timezone": "Europe/Amsterdam",
+}
 
-async def test_city_lookup_returns_none_on_error_code(fake_http):
-    fake_http.responder = lambda url, params: FakeResponse(payload={"code": "402"})
+OPEN_METEO_RESPONSE = {
+    "current": {
+        "temperature_2m": 10.2,
+        "weather_code": 3,
+        "precipitation": 0.0,
+        "relative_humidity_2m": 65,
+    },
+    "daily": {
+        "time": ["2026-11-16", "2026-11-17"],
+        "weather_code": [61, 0],
+        "temperature_2m_max": [10.4, 12.0],
+        "temperature_2m_min": [4.2, 5.0],
+        "precipitation_probability_max": [80, 5],
+    },
+}
 
-    result = await weather_module.fetch_city_info("杭州", "key", "host")
 
-    assert result is None
+@pytest.fixture(autouse=True)
+def clear_weather_cache():
+    from core.utils.cache.config import CacheType
+    from core.utils.cache.manager import cache_manager
+
+    cache_manager.clear(CacheType.WEATHER)
+    yield
+    cache_manager.clear(CacheType.WEATHER)
 
 
-async def test_city_lookup_returns_none_on_non_json_body(fake_http):
+def _weather_conn():
+    return FakeConn({"get_weather": dict(HOME_WEATHER_CONFIG)})
+
+
+async def test_forecast_uses_open_meteo_without_api_key(fake_http):
+    """Eén forecast-verzoek, geen sleutel, geen geocoding voor de eigen plaats."""
+    fake_http.responder = lambda url, params: FakeResponse(payload=OPEN_METEO_RESPONSE)
+
+    response = await weather_module.get_weather(
+        _weather_conn(), location="Zoetermeer", lang="nl"
+    )
+    report = response.result or ""
+
+    assert "Weer in Zoetermeer: nu 10°C, bewolkt, droog" in report
+    assert "ma 4°C/10°C lichte regen, 80% kans op neerslag" in report
+    assert len(fake_http.requests) == 1
+    request = fake_http.requests[0]
+    assert request["url"] == "https://api.open-meteo.com/v1/forecast"
+    assert "key" not in (request["params"] or {})
+    assert request["params"]["timezone"] == "Europe/Amsterdam"
+    assert request["params"]["forecast_days"] == 7
+
+
+async def test_unknown_place_returns_dutch_error_without_crashing(fake_http):
+    fake_http.responder = lambda url, params: FakeResponse(payload={"results": []})
+
+    response = await weather_module.get_weather(
+        _weather_conn(), location="Onbekenddorp", lang="nl"
+    )
+    report = response.result or ""
+
+    assert "Ik kan het weer voor Onbekenddorp nu niet vinden" in report
+    assert fake_http.requests[0]["url"] == "https://geocoding-api.open-meteo.com/v1/search"
+    assert fake_http.requests[0]["params"]["name"] == "Onbekenddorp"
+
+
+async def test_forecast_http_error_returns_dutch_error(fake_http):
     fake_http.responder = lambda url, params: FakeResponse(
-        text="<html>oops</html>", json_error=ValueError("not json")
+        status_code=503, payload={"error": True}
     )
 
-    result = await weather_module.fetch_city_info("杭州", "key", "host")
-
-    assert result is None
-
-
-async def test_city_lookup_returns_none_on_non_dict_body(fake_http):
-    fake_http.responder = lambda url, params: FakeResponse(payload=["not", "an", "object"])
-
-    result = await weather_module.fetch_city_info("杭州", "key", "host")
-
-    assert result is None
-
-
-async def test_city_lookup_returns_none_on_empty_location(fake_http):
-    fake_http.responder = lambda url, params: FakeResponse(
-        payload={"code": "200", "location": []}
+    response = await weather_module.get_weather(
+        _weather_conn(), location="Zoetermeer", lang="nl"
     )
+    report = response.result or ""
 
-    result = await weather_module.fetch_city_info("杭州", "key", "host")
-
-    assert result is None
-
-
-async def test_city_lookup_searches_all_cities(fake_http):
-    """不带 range 参数就是全球检索，写死 cn 会查不到境外城市。"""
-    fake_http.responder = lambda url, params: FakeResponse(
-        payload={"code": "200", "location": [{"id": "101210101", "name": "杭州"}]}
-    )
-
-    result = await weather_module.fetch_city_info("杭州", "key", "host")
-
-    assert result == {"id": "101210101", "name": "杭州"}
-    sent = fake_http.requests[0]["params"]
-    assert "range" not in sent
-    assert sent["location"] == "杭州"
-    assert sent["number"] == 1
+    assert "probeer het later opnieuw" in report
 
 
-# ---------------------------------------------------------------------------
-# 天气数据
-# ---------------------------------------------------------------------------
+async def test_other_city_is_geocoded_and_named(fake_http):
+    """Een andere plaats dan de eigen locatie wordt gegeocodeerd en genoemd."""
 
-
-def _weather_responder(now_payload, daily_payload):
     def responder(url, params):
-        if url.endswith("/now"):
-            return now_payload if isinstance(now_payload, FakeResponse) else FakeResponse(
-                payload=now_payload
+        if "geocoding" in url:
+            return FakeResponse(
+                payload={
+                    "results": [
+                        {
+                            "name": "Utrecht",
+                            "latitude": 52.09,
+                            "longitude": 5.12,
+                            "country": "Nederland",
+                        }
+                    ]
+                }
             )
-        return daily_payload if isinstance(daily_payload, FakeResponse) else FakeResponse(
-            payload=daily_payload
-        )
+        return FakeResponse(payload=OPEN_METEO_RESPONSE)
 
-    return responder
-
-
-async def test_weather_data_needs_both_now_and_daily(fake_http):
-    fake_http.responder = _weather_responder(
-        {"code": "200", "now": {"text": "晴"}},
-        FakeResponse(status_code=401, payload={"code": "401"}),
-    )
-
-    assert await weather_module.fetch_weather_data({"id": "1"}, "key", "host") is None
-
-
-async def test_weather_data_needs_daily_when_now_failed(fake_http):
-    fake_http.responder = _weather_responder(
-        FakeResponse(status_code=401, payload={"code": "401"}),
-        {"code": "200", "daily": [{"fxDate": "2026-10-24"}]},
-    )
-
-    assert await weather_module.fetch_weather_data({"id": "1"}, "key", "host") is None
-
-
-async def test_weather_data_returns_both_when_all_succeed(fake_http):
-    fake_http.responder = _weather_responder(
-        {"code": "200", "now": {"text": "晴"}},
-        {"code": "200", "daily": [{"fxDate": "2026-10-24"}]},
-    )
-
-    now, daily = await weather_module.fetch_weather_data({"id": "1"}, "key", "host")
-
-    assert now["now"]["text"] == "晴"
-    assert daily["daily"][0]["fxDate"] == "2026-10-24"
-
-
-async def test_weather_page_follows_redirects(fake_http):
-    """旧形态 fxLink 会 302，不跟随重定向就拿不到内容。"""
-    fake_http.responder = lambda url, params: FakeResponse(text="<html></html>")
-
-    await weather_module.fetch_weather_page("https://www.qweather.com/weather/101210101.html")
-
-    assert fake_http.init_kwargs.get("follow_redirects") is True
-
-
-def test_weather_report_keeps_pressure_and_precipitation():
-    report = weather_module.build_weather_report(
-        {"name": "杭州"},
-        {"now": {"text": "多云", "temp": "24", "pressure": "1003", "precip": "0.0"}},
-        {"daily": []},
-    )
-
-    assert "气压: 1003百帕" in report
-    assert "降水量: 0.0毫米" in report
-
-
-async def test_weather_report_keeps_pressure_and_precipitation_in_flow(monkeypatch):
-    """走完整条链路时报告里也要有气压和降水量。"""
-    monkeypatch.setattr(
-        weather_module,
-        "fetch_city_info",
-        _async_value({"id": "1", "name": "杭州"}),
-    )
-    monkeypatch.setattr(
-        weather_module,
-        "fetch_weather_data",
-        _async_value(
-            ({"now": {"text": "多云", "pressure": "1003", "precip": "0.0"}}, {"daily": []})
-        ),
-    )
+    fake_http.responder = responder
 
     response = await weather_module.get_weather(
-        FakeConn({"get_weather": {"api_key": "k", "api_host": "h"}}), location="气压测试市"
+        _weather_conn(), location="Utrecht", lang="nl"
     )
+    report = response.result or ""
 
-    assert "气压: 1003百帕" in response.result
-    assert "降水量: 0.0毫米" in response.result
-
-
-async def test_missing_fxlink_does_not_call_web_fallback(monkeypatch):
-    """城市信息里没有 fxLink 时不该去抓网页，直接报失败。"""
-    called = []
-
-    async def fake_city_info(*args, **kwargs):
-        return {"id": "1", "name": "杭州"}
-
-    async def fake_weather_data(*args, **kwargs):
-        return None
-
-    async def fake_page(url):
-        called.append(url)
-        return None
-
-    monkeypatch.setattr(weather_module, "fetch_city_info", fake_city_info)
-    monkeypatch.setattr(weather_module, "fetch_weather_data", fake_weather_data)
-    monkeypatch.setattr(weather_module, "fetch_weather_page", fake_page)
-
-    response = await weather_module.get_weather(
-        FakeConn({"get_weather": {"api_key": "k", "api_host": "h"}}), location="无链接市"
-    )
-
-    assert called == []
-    assert response.response == "请求天气数据失败"
-
-
-async def test_city_not_found_message_does_not_blame_the_place_name(monkeypatch):
-    """key 失效和城市找不到都落到这句话，不能让用户去核对地名。"""
-
-    async def fake_city_info(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(weather_module, "fetch_city_info", fake_city_info)
-
-    response = await weather_module.get_weather(
-        FakeConn({"get_weather": {"api_key": "k", "api_host": "h"}}), location="随便什么市"
-    )
-
-    assert "请确认地点是否正确" not in response.result
-    assert "天气服务不可用" in response.result
+    assert report.startswith("Weer in Utrecht: nu 10°C")
+    assert fake_http.requests[1]["params"]["latitude"] == 52.09
+    assert fake_http.requests[1]["params"]["longitude"] == 5.12
 
 
 # ---------------------------------------------------------------------------
@@ -327,10 +261,3 @@ async def test_news_items_keep_valid_entries(fake_http):
     items = await news_module.fetch_news_from_api(FakeConn(), "thepaper")
 
     assert items == [{"id": "2", "title": "有效标题"}]
-
-
-def _async_value(value):
-    async def _inner(*args, **kwargs):
-        return value
-
-    return _inner

@@ -2,24 +2,32 @@ from datetime import datetime
 import cnlunar
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
 
+# NOTE (t_c30a9895): get_lunar is a Chinese-calendar tool (cnlunar) and for a Dutch
+# household it is arguably irrelevant. Its descriptions are translated anyway so the
+# LLM prompt stays Dutch, and the tool is kept (not removed) — removal is the owner's
+# call, flagged in the handoff. The VALUES it returns are Chinese calendar names
+# (干支, 生肖, 宜忌) because cnlunar has no Dutch/English data source for them; the
+# Dutch instruction line below tells the model to answer in Dutch regardless.
 get_lunar_function_desc = {
     "type": "function",
     "function": {
         "name": "get_lunar",
         "description": (
-            "查询指定日期的农历/黄历信息（干支、节气、生肖、宜忌等），默认今天。"
-            "问'今天农历多少'等基本查询直接用context，不要调用此工具。"
+            "Vraagt Chinese kalender-/almanakinformatie op voor een datum "
+            "(jaarcyclus, zonneperiodes, dierenriem, gunstige en ongunstige dagen enz.), "
+            "standaard vandaag. Voor een simpele vraag als 'welke datum is het vandaag' "
+            "gebruik je de context, niet deze tool."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "date": {
                     "type": "string",
-                    "description": "要查询的日期，格式为YYYY-MM-DD，例如2024-01-01。如果不提供，则使用当前日期",
+                    "description": "De datum om op te vragen, als YYYY-MM-DD, bijvoorbeeld 2024-01-01. Zonder waarde wordt de huidige datum gebruikt",
                 },
                 "query": {
                     "type": "string",
-                    "description": "要查询的内容，例如阴历日期、天干地支、节日、节气、生肖、星座、八字、宜忌等",
+                    "description": "Wat je wilt opvragen, bijvoorbeeld de maankalenderdatum, de jaarcyclus, feestdagen, zonneperiodes, het dierenriemteken, sterrenbeeld, of gunstige/ongunstige dagen",
                 },
             },
             "required": [],
@@ -42,7 +50,7 @@ def get_lunar(date=None, query=None):
         except ValueError:
             return ActionResponse(
                 Action.REQLLM,
-                f"日期格式错误，请使用YYYY-MM-DD格式，例如：2024-01-01",
+                f"Ongeldige datumnotatie, gebruik YYYY-MM-DD, bijvoorbeeld: 2024-01-01",
                 None,
             )
     else:
@@ -52,7 +60,7 @@ def get_lunar(date=None, query=None):
 
     # 如果 query 为 None，则使用默认文本
     if query is None:
-        query = "默认查询干支年和农历日期"
+        query = "het Chinese kalenderjaar en de maankalenderdatum"
 
     # 尝试从缓存获取农历信息
     lunar_cache_key = f"lunar_info_{current_date}"
@@ -60,21 +68,28 @@ def get_lunar(date=None, query=None):
     if cached_lunar_info:
         return ActionResponse(Action.REQLLM, cached_lunar_info, None)
 
-    response_text = f"根据以下信息回应用户的查询请求，并提供与{query}相关的信息：\n"
+    # The label text is Dutch (it is read by the model); the almanac values stay as
+    # cnlunar produces them.
+    response_text = (
+        f"Beantwoord de vraag van de gebruiker met de onderstaande gegevens over {query}.\n"
+        "Antwoord in het Nederlands, ook als hieronder Chinese kalendertermen staan; "
+        "noem die termen alleen als de gebruiker er zelf naar vraagt.\n"
+        "Chinese kalendergegevens:\n"
+    )
 
     lunar = cnlunar.Lunar(now, godType="8char")
     response_text += (
-        "农历信息：\n"
-        "%s年%s%s\n" % (lunar.lunarYearCn, lunar.lunarMonthCn[:-1], lunar.lunarDayCn)
-        + "干支: %s年 %s月 %s日\n" % (lunar.year8Char, lunar.month8Char, lunar.day8Char)
-        + "生肖: 属%s\n" % (lunar.chineseYearZodiac)
-        + "八字: %s\n"
+        "%s jaar, %s maand, %s\n" % (lunar.lunarYearCn, lunar.lunarMonthCn[:-1], lunar.lunarDayCn)
+        + "Jaarcyclus: %s jaar, %s maand, %s dag\n"
+        % (lunar.year8Char, lunar.month8Char, lunar.day8Char)
+        + "Dierenriem: jaar van de %s\n" % (lunar.chineseYearZodiac)
+        + "Acht tekens: %s\n"
         % (
             " ".join(
                 [lunar.year8Char, lunar.month8Char, lunar.day8Char, lunar.twohour8Char]
             )
         )
-        + "今日节日: %s\n"
+        + "Feestdagen vandaag: %s\n"
         % (
             ",".join(
                 filter(
@@ -87,36 +102,37 @@ def get_lunar(date=None, query=None):
                 )
             )
         )
-        + "今日节气: %s\n" % (lunar.todaySolarTerms)
-        + "下一节气: %s %s年%s月%s日\n"
+        + "Zonneperiode vandaag: %s\n" % (lunar.todaySolarTerms)
+        + "Volgende zonneperiode: %s %s-%s-%s\n"
         % (
             lunar.nextSolarTerm,
             lunar.nextSolarTermYear,
             lunar.nextSolarTermDate[0],
             lunar.nextSolarTermDate[1],
         )
-        + "今年节气表: %s\n"
+        + "Zonneperiodes dit jaar: %s\n"
         % (
             ", ".join(
                 [
-                    f"{term}({date[0]}月{date[1]}日)"
+                    f"{term}({date[0]}-{date[1]})"
                     for term, date in lunar.thisYearSolarTermsDic.items()
                 ]
             )
         )
-        + "生肖冲煞: %s\n" % (lunar.chineseZodiacClash)
-        + "星座: %s\n" % (lunar.starZodiac)
-        + "纳音: %s\n" % lunar.get_nayin()
-        + "彭祖百忌: %s\n" % (lunar.get_pengTaboo(delimit=", "))
-        + "值日: %s执位\n" % lunar.get_today12DayOfficer()[0]
-        + "值神: %s(%s)\n"
+        + "Dierenriemconflict: %s\n" % (lunar.chineseZodiacClash)
+        + "Sterrenbeeld: %s\n" % (lunar.starZodiac)
+        + "Nayin: %s\n" % lunar.get_nayin()
+        + "Taboes van de dag: %s\n" % (lunar.get_pengTaboo(delimit=", "))
+        + "Dagdienst: %s\n" % lunar.get_today12DayOfficer()[0]
+        + "Daggeest: %s(%s)\n"
         % (lunar.get_today12DayOfficer()[1], lunar.get_today12DayOfficer()[2])
-        + "廿八宿: %s\n" % lunar.get_the28Stars()
-        + "吉神方位: %s\n" % " ".join(lunar.get_luckyGodsDirection())
-        + "今日胎神: %s\n" % lunar.get_fetalGod()
-        + "宜: %s\n" % "、".join(lunar.goodThing[:10])
-        + "忌: %s\n" % "、".join(lunar.badThing[:10])
-        + "(默认返回干支年和农历日期；仅在要求查询宜忌信息时才返回本日宜忌)"
+        + "28 sterrenbeelden: %s\n" % lunar.get_the28Stars()
+        + "Richting geluksgoden: %s\n" % " ".join(lunar.get_luckyGodsDirection())
+        + "Vandaag: %s\n" % lunar.get_fetalGod()
+        + "Gunstig: %s\n" % ",".join(lunar.goodThing[:10])
+        + "Ongunstig: %s\n" % ",".join(lunar.badThing[:10])
+        + "(Standaard worden alleen het kalenderjaar en de maankalenderdatum gegeven; "
+        "de gunstige/ongunstige dagen alleen als de gebruiker daarom vraagt)"
     )
 
     # 缓存农历信息
