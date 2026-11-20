@@ -15,6 +15,80 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
+# ---- t_a2a3bf8a: 设备 MCP 工具列表分页（nextCursor）的发布与兜底 ----
+
+# 设备收到 tools/list 后分页推送工具。若协议中途断掉（少一页），列表永远“不完整”，
+# 那么设备工具就一个都用不上。因此超时后先把已收到的页发布出去（旧行为），
+# 并大声记日志，等真正的最后一页到了再 merge 补齐。
+TOOLS_LIST_INCOMPLETE_TIMEOUT_SECONDS = 10.0
+
+
+def _localize_tool_descriptions(mcp_client: MCPClient) -> None:
+    """把工具描述里的原始工具名换成模型看到的（sanitized）名字，再套荷兰语覆盖。"""
+    for tool_data in mcp_client.tools.values():
+        if "description" in tool_data:
+            description = tool_data["description"]
+            for sanitized_name, original_name in mcp_client.name_mapping.items():
+                description = description.replace(original_name, sanitized_name)
+            tool_data["description"] = description
+
+
+async def _finalise_tool_list(
+    conn: "ConnectionHandler", mcp_client: MCPClient, merge: bool = False
+) -> dict:
+    """发布暂存的工具列表并刷新函数表；最后一步才置 ready 并唤醒首轮等待。"""
+    published = await mcp_client.publish_staged_tools(merge=merge)
+    _localize_tool_descriptions(mcp_client)
+    await mcp_client.set_ready(True)
+
+    if hasattr(conn, "func_handler") and conn.func_handler:
+        conn.func_handler.tool_manager.refresh_tools()
+        conn.func_handler.current_support_functions()
+
+    # 顺序很重要：先刷新函数表，再唤醒首轮请求，否则被唤醒的那一轮可能读到旧缓存。
+    mcp_client.mark_tools_complete()
+    logger.bind(tag=TAG).info(
+        f"设备MCP工具列表已发布(完整): tools={len(published)} merge={merge}"
+    )
+    return published
+
+
+async def _tools_list_watchdog(
+    conn: "ConnectionHandler",
+    mcp_client: MCPClient,
+    timeout: float = TOOLS_LIST_INCOMPLETE_TIMEOUT_SECONDS,
+):
+    """兜底：分页迟迟收不全时先发布已收到的部分，避免设备工具整场缺席。"""
+    try:
+        await asyncio.sleep(timeout)
+        if getattr(conn, "mcp_client", None) is not mcp_client:
+            return
+        if mcp_client.tools_complete:
+            return
+        published = await _finalise_tool_list(conn, mcp_client, merge=True)
+        logger.bind(tag=TAG).warning(
+            f"设备MCP工具列表 {timeout:.0f}s 内未收全，先发布已收到的 {len(published)} 个"
+            "（部分列表；后续页到达后会合并补齐）"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.bind(tag=TAG).error(f"设备MCP工具列表兜底发布失败: {e}")
+
+
+def _ensure_tools_list_watchdog(conn: "ConnectionHandler", mcp_client: MCPClient) -> None:
+    """每个连接只起一个兜底看护任务。"""
+    existing = getattr(conn, "_mcp_tools_watchdog", None)
+    if existing is not None and not existing.done():
+        return
+    try:
+        conn._mcp_tools_watchdog = asyncio.create_task(
+            _tools_list_watchdog(conn, mcp_client)
+        )
+    except RuntimeError as e:  # 没有运行中的事件循环：不兜底也不能炸主流程
+        logger.bind(tag=TAG).warning(f"无法启动设备MCP工具列表兜底任务: {e}")
+
+
 async def send_mcp_message(conn: "ConnectionHandler", payload: dict):
     """Helper to send MCP messages, encapsulating common logic."""
     if not conn.features.get("mcp"):
@@ -76,6 +150,9 @@ async def handle_mcp_message(
                     f"客户端设备支持的工具数量: {len(tools_data)}"
                 )
 
+                # t_a2a3bf8a: 每页只暂存，最后一页才统一发布。之前的实现边收边
+                # publish，首轮在分页中途就看到了半成品列表（39 个里只有 8 个），
+                # 于是模型调用一个服务器还不认识的工具、被回“工具不存在”。
                 for i, tool in enumerate(tools_data):
                     if not isinstance(tool, dict):
                         continue
@@ -97,35 +174,24 @@ async def handle_mcp_message(
                         "description": description,
                         "inputSchema": input_schema,
                     }
-                    await mcp_client.add_tool(new_tool)
+                    await mcp_client.stage_tool(new_tool)
                     logger.bind(tag=TAG).debug(f"客户端工具 #{i+1}: {name}")
 
-                # 替换所有工具描述中的工具名称
-                for tool_data in mcp_client.tools.values():
-                    if "description" in tool_data:
-                        description = tool_data["description"]
-                        # 遍历所有工具名称进行替换
-                        for (
-                            sanitized_name,
-                            original_name,
-                        ) in mcp_client.name_mapping.items():
-                            description = description.replace(
-                                original_name, sanitized_name
-                            )
-                        tool_data["description"] = description
+                next_cursor = result.get("nextCursor", "") or ""
+                logger.bind(tag=TAG).info(
+                    f"设备MCP工具分页: 本页={len(tools_data)} 累计暂存="
+                    f"{mcp_client.staged_tool_count()} nextCursor={next_cursor or '<none>'}"
+                )
 
-                next_cursor = result.get("nextCursor", "")
                 if next_cursor:
-                    logger.bind(tag=TAG).debug(f"有更多工具，nextCursor: {next_cursor}")
+                    _ensure_tools_list_watchdog(conn, mcp_client)
                     await send_mcp_tools_list_continue_request(conn, next_cursor)
                 else:
-                    await mcp_client.set_ready(True)
-                    logger.bind(tag=TAG).debug("所有工具已获取，MCP客户端准备就绪")
-
-                    # 刷新工具缓存，确保MCP工具被包含在函数列表中
-                    if hasattr(conn, "func_handler") and conn.func_handler:
-                        conn.func_handler.tool_manager.refresh_tools()
-                        conn.func_handler.current_support_functions()
+                    # 最后一页：一次性发布完整列表。已因超时兜底发布过部分列表时
+                    # 走 merge，避免把前面几页丢掉。
+                    await _finalise_tool_list(
+                        conn, mcp_client, merge=mcp_client.tools_complete
+                    )
             return
 
     # Handle method calls (requests from the client)
@@ -217,6 +283,10 @@ async def call_mcp_tool(
         raise RuntimeError("MCP客户端尚未准备就绪")
 
     if not mcp_client.has_tool(tool_name):
+        # t_a2a3bf8a: 分页还没收全时不要断言“不存在”（等页的重试在
+        # ToolManager.execute_tool 里，那里才持有完整工具表）。
+        if not mcp_client.tools_complete:
+            raise ValueError(f"工具 {tool_name} 不存在（设备MCP工具列表尚未接收完整）")
         raise ValueError(f"工具 {tool_name} 不存在")
 
     tool_call_id = await mcp_client.get_next_id()

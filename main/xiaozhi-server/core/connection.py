@@ -778,6 +778,31 @@ class ConnectionHandler:
         )
         return waited_ms
 
+    def _await_device_tools_ready(self, timeout=1.0):
+        """首轮不要用「设备 MCP 工具列表只到第一页」的半成品构造请求（t_a2a3bf8a）。
+
+        设备把 ~40 个工具分页推送（nextCursor）。完整列表到达前设备工具一律先暂存、
+        不发布，所以这里等待只是为了让首轮**尽量**能用上设备工具；等不到就照常继续，
+        这一轮没有设备工具（而不是只给 8 个，让模型调用一个服务器还不认识的工具）。
+        """
+        mcp_client = getattr(self, "mcp_client", None)
+        if mcp_client is None or mcp_client.tools_complete:
+            return 0.0
+        started = time.monotonic()
+        ready = mcp_client.wait_for_tools(timeout)
+        waited_ms = int((time.monotonic() - started) * 1000)
+        staged = mcp_client.staged_tool_count()
+        self.logger.bind(tag=TAG).info(
+            f"设备MCP工具列表就绪检查: waited_ms={waited_ms} complete={ready} "
+            f"published={len(mcp_client.tools)} staged={staged}"
+        )
+        if not ready:
+            self.logger.bind(tag=TAG).warning(
+                "首轮在设备MCP工具列表完整前开始：本轮不注入设备工具"
+                f"（已暂存 {staged} 个，收全后下一轮生效）"
+            )
+        return waited_ms
+
     def _log_first_turn_prefix(self, messages_for_llm, tools):
         """打印首轮真实请求的前缀指纹，与 warmup 日志里的 hash 逐字比对（t_a5523178）。"""
         if self._first_turn_prefix_logged:
@@ -1159,6 +1184,9 @@ class ConnectionHandler:
             # 首轮必须等组件初始化完成：否则 system prompt 还是 quick prompt，
             # 与预热快照（增强 prompt + few-shot）不是同一前缀，缓存永远命中不了
             self._await_first_turn_ready()
+            # t_a2a3bf8a: 设备 MCP 工具列表是分页推送的；完整前不要用半成品构造
+            # 请求（首轮曾只有 39 个里的 8 个，模型调用到不存在的工具）。
+            self._await_device_tools_ready()
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self.dialogue.put(Message(role="user", content=query))

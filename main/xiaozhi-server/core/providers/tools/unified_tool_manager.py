@@ -70,6 +70,23 @@ class ToolManager:
         tool_def = tools.get(tool_name)
         return tool_def.tool_type if tool_def else None
 
+    async def _await_device_tools_if_paging(self, tool_name: str) -> bool:
+        """设备 MCP 工具列表分页未收全时，为“工具不存在”这个结论有界地等一下。
+
+        t_a2a3bf8a：设备把 ~40 个工具按 nextCursor 分页推送，重启后用户的第一句话
+        常比最后几页先到。旧逻辑在这里直接判 `工具 X 不存在`，于是明明设备支持、
+        只是还没推完的工具被当成不存在，用户听到的是一句错误的中文提示。
+        """
+        mcp_client = getattr(self.conn, "mcp_client", None)
+        if mcp_client is None or mcp_client.tools_complete:
+            return False
+        self.logger.info(f"工具 {tool_name} 暂不在列表，等设备MCP工具列表分页收全")
+        if not await mcp_client.wait_for_pending_tools():
+            return False
+        # 收全后 ToolManager 的缓存还是旧的，必须刷新才能查到新工具。
+        self.refresh_tools()
+        return True
+
     async def execute_tool(
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> ActionResponse:
@@ -77,6 +94,8 @@ class ToolManager:
         try:
             # 查找工具类型
             tool_type = self.get_tool_type(tool_name)
+            if not tool_type and await self._await_device_tools_if_paging(tool_name):
+                tool_type = self.get_tool_type(tool_name)
             if not tool_type:
                 return ActionResponse(
                     action=Action.NOTFOUND,
